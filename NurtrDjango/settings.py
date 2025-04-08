@@ -50,6 +50,7 @@ CORS_ALLOWED_ORIGINS = [
     'https://nurtr-453016.web.app',
     'https://nurtr-453016.firebaseapp.com',
     'http://localhost:5173',  # For development
+    'https://www.nurtr.io', # For production
 ]
 
 CORS_ALLOW_METHODS = [
@@ -76,6 +77,7 @@ CSRF_TRUSTED_ORIGINS = [
     'http://localhost:*',  # For development
     'https://nurtr-453016.web.app',  # Your Firebase hosting URL
     'https://nurtr-453016.firebaseapp.com',  # Alternative Firebase URL
+    'https://www.nurtr.io',
 ]
 
 # Application definition
