@@ -33,6 +33,7 @@ ALLOWED_HOSTS = [
     'nurtr-453016.web.app',
     'nurtr-453016.firebaseapp.com',
     'nurtr-django-939788693075.us-central1.run.app',
+    'www.nurtr.io',
 ]
 
 # For local development
@@ -46,12 +47,18 @@ if not DEBUG:
     CSRF_COOKIE_SECURE = True
 
 CORS_ALLOW_ALL_ORIGINS = False
+
+CORS_ALLOW_CREDENTIALS = True
+
 CORS_ALLOWED_ORIGINS = [
     'https://nurtr-453016.web.app',
     'https://nurtr-453016.firebaseapp.com',
     'http://localhost:5173',  # For development
     'https://www.nurtr.io', # For production
 ]
+
+SESSION_COOKIE_SAMESITE = 'None'  # Required for cross-site cookies
+CSRF_COOKIE_SAMESITE = 'None'     # Required for cross-site cookies
 
 CORS_ALLOW_METHODS = [
     'DELETE',
