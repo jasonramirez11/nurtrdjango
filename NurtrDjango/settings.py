@@ -28,14 +28,16 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-!w+#s@0dqrzfmel*+bm
 DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
 
 ALLOWED_HOSTS = [
-        'http://localhost:5173',
-        '*',
-        '0.0.0.0',
-        'localhost',
-        'nurtr-453016.web.app',  # Your Firebase hosting domain
-        'nurtr-453016.firebaseapp.com',  # Your Firebase hosting domain
-        'nurtr-django-939788693075.us-central1.run.app',  # Your Cloud Run domain
-    ]
+    'localhost',
+    '127.0.0.1',
+    'nurtr-453016.web.app',
+    'nurtr-453016.firebaseapp.com',
+    'nurtr-django-939788693075.us-central1.run.app',
+]
+
+# For local development
+if DEBUG:
+    ALLOWED_HOSTS += ['0.0.0.0', 'localhost']
 
 # Security settings
 if not DEBUG:
