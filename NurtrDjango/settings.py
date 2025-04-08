@@ -32,6 +32,9 @@ ALLOWED_HOSTS = [
         '*',
         '0.0.0.0',
         'localhost',
+        'nurtr-453016.web.app',  # Your Firebase hosting domain
+        'nurtr-453016.firebaseapp.com',  # Your Firebase hosting domain
+        'nurtr-django-939788693075.us-central1.run.app',  # Your Cloud Run domain
     ]
 
 # Security settings
