@@ -45,8 +45,13 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
 
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = [
+    'https://nurtr-453016.web.app',
+    'https://nurtr-453016.firebaseapp.com',
+    'http://localhost:5173',  # For development
+]
+
 CORS_ALLOW_METHODS = [
     'DELETE',
     'GET',
@@ -69,8 +74,8 @@ CORS_ALLOW_HEADERS = [
 
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:*',  # For development
-    '[https://nurtr-453016.web.app](https://nurtr-453016.web.app)',  # Your Firebase hosting URL
-    '[https://nurtr-453016.firebaseapp.com](https://nurtr-453016.firebaseapp.com)'  # Alternative Firebase URL
+    'https://nurtr-453016.web.app',  # Your Firebase hosting URL
+    'https://nurtr-453016.firebaseapp.com',  # Alternative Firebase URL
 ]
 
 # Application definition
