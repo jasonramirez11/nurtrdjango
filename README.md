@@ -1,0 +1,2 @@
+# nurturdjango
+django app
