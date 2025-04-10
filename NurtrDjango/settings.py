@@ -14,6 +14,11 @@ from pathlib import Path
 #from decouple import config #check this
 import os
 
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 

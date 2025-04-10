@@ -326,7 +326,7 @@ class PlacesAPIView(APIView):
                     }
                 },
                 "includedTypes": group_types,
-                "maxResultCount": 5,
+                "maxResultCount": 17,
             }
 
             all_results = []
