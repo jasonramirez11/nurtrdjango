@@ -239,6 +239,7 @@ class PlacesAPIView(APIView):
             print(f"num results after filter {len(all_results)}")
 
             all_results = await self.fetch_place_images(all_results)
+            all_results = [p for p in all_results if p.get("imagePlaces", [])]
             #detailed_results = await self.async_fetch_all_place_details(all_results, filters, min_price, max_price, session)
         
         #print(f'all plcace results: {len(all_results)}')
@@ -260,7 +261,7 @@ class PlacesAPIView(APIView):
         async with session.get(url, headers=headers) as response:
             details_data = await response.json()
         
-        photos = details_data.get("photos", [])[:5]  # Limit to first 5 photos
+        photos = details_data.get("photos", [])[:3]  # Limit to first 5 photos
         image_places = []
 
         for photo in photos:
@@ -284,7 +285,8 @@ class PlacesAPIView(APIView):
                 return await self.async_fetch_place_details(place_id, session)
 
         place_details = asyncio.run(fetch_details())
-
+        
+        print('Number of reviews for place', len(place_details.get('reviews', [])))
         #print('place details', place_details)
 
         if not place_details:
@@ -297,7 +299,7 @@ class PlacesAPIView(APIView):
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": self.API_KEY,
-            "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.businessStatus,places.photos,places.formattedAddress,places.priceRange,places.types",  # Include places.id
+            "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.businessStatus,places.photos,places.formattedAddress,places.priceRange,places.types,places.userRatingCount,places.rating",  # Include places.id
         }
 
         # Get the list of types from params, default to ["restaurant"]
@@ -386,7 +388,8 @@ class PlacesAPIView(APIView):
         #print(f"Place details results: {results}")
 
         filtered_places = [res for res in results if res]
-        await self.fetch_place_images(filtered_places, session)
+        filtered_places = await self.fetch_place_images(filtered_places, session)
+
         return filtered_places
 
     async def fetch_place_images(self, places):
