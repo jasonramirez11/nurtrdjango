@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import uuid
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -134,15 +135,20 @@ def set_cors_for_get(bucket_name):
 
 def upload_single_image_threaded(blob, local_path):
     """Helper synchronous function to be run in a thread."""
-    try:
-        blob.upload_from_filename(local_path)
-        print(f"Successfully uploaded {local_path} to {blob.name}")
-        # Make the blob publicly viewable (optional, adjust as needed)
-        # blob.make_public()
-        return blob.public_url
-    except Exception as e:
-        print(f"Error uploading {local_path} to {blob.name}: {e}")
-        return None # Indicate failure
+    max_attempts = 5
+
+    for _ in range(max_attempts):
+        try:
+            blob.upload_from_filename(local_path)
+            print(f"Successfully uploaded {local_path} to {blob.name}")
+            # Make the blob publicly viewable (optional, adjust as needed)
+            # blob.make_public()
+            return blob.public_url
+        except Exception as e:
+            print(f"Error uploading {local_path} to {blob.name}: {e}")
+            time.sleep(random.randint(2,3))
+
+    return None # Indicate failure
 
 def upload_place_images_to_bucket(
     bucket_name, place_id, image_paths
@@ -203,23 +209,6 @@ def upload_place_images_to_bucket(
     print(f"Total time for {len(gcs_links)} successful uploads: {end_time - start_time:.2f} seconds")
     return gcs_links
 
-    """
-    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
-
-    # Process results
-    for result in results:
-        if isinstance(result, Exception):
-            # Log the exception if gather caught one
-            print(f"An exception occurred during upload: {result}")
-        elif result:  # Check if the result is a URL (not None)
-            gcs_links.append(result)
-        # Else: upload_single_image_threaded returned None due to an error already printed
-
-    end_time = time.time()
-    print(f"Finished uploading for Place ID '{place_id}'.")
-    print(f"Total time for {len(gcs_links)} successful uploads: {end_time - start_time:.2f} seconds")
-    return gcs_links
-    """
 
 def download_image(image_url, local_file_path):
     """Download the image and save locally."""
@@ -406,7 +395,7 @@ class PlacesAPIView(APIView):
             all_results = [r for r in all_results if self.apply_filters(r, filters, min_price, max_price)]
             print(f"num results after filter {len(all_results)}")
 
-            all_results = await self.fetch_place_images(all_results)
+            all_results = await self.fetch_place_images(all_results, max_images=1)
             all_results = [p for p in all_results if p.get("imagePlaces", [])]
 
             # Make temporary directory for images
@@ -427,7 +416,7 @@ class PlacesAPIView(APIView):
 
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(IMAGE_DOWNLOAD_URL, json=data, timeout=15) as response:
+                        async with session.post(IMAGE_DOWNLOAD_URL, json=data, timeout=30) as response:
                             if response.status == 200:
                                 response_data = await response.json()
                                 print(f"Image download successful for place ID {place['id']}")
@@ -674,10 +663,10 @@ class PlacesAPIView(APIView):
 
         return filtered_places
 
-    async def fetch_place_images(self, places):
+    async def fetch_place_images(self, places, max_images=3):
         """Fetch up to 5 photos for each place and add imagePlaces key."""
         for place in places:
-            photos = place.get("photos", [])[:3]  # Limit to first 5 photos
+            photos = place.get("photos", [])[:max_images]  # Limit to first 3 photos
             image_places = []
 
             print(f"num distinct photos: {len(set([p['name'] for p in photos]))}")
@@ -785,29 +774,34 @@ class ImageDownloadAPIView(APIView):
         local_image_paths = []
         os.makedirs("temp_images", exist_ok=True)
 
-        # Check for existing images
-        existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
-        if existing_image_links:
-            print(f"Returning existing images for place ID {place_id}")
-            return Response({
-                'gcs_image_urls': existing_image_links,
-            }, status=HTTP_200_OK)
-        else:
-            print(f"Downloading images for place ID {place_id}...")
-            for image_url in image_urls:
-                local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
-                download_image(image_url, local_file_path)
-                local_image_paths.append(local_file_path)
+        try:
+            # Check for existing images
+            existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
+            if existing_image_links:
+                print(f"Returning existing images for place ID {place_id}")
+                return Response({
+                    'gcs_image_urls': existing_image_links,
+                }, status=HTTP_200_OK)
+            else:
+                print(f"Downloading images for place ID {place_id}...")
+                for image_url in image_urls:
+                    local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
+                    download_image(image_url, local_file_path)
+                    local_image_paths.append(local_file_path)
 
-            gcs_place_image_links = upload_place_images_to_bucket(
-                bucket_name='nurtr-places',
-                place_id=place_id,
-                image_paths=local_image_paths
-            )
+                gcs_place_image_links = upload_place_images_to_bucket(
+                    bucket_name='nurtr-places',
+                    place_id=place_id,
+                    image_paths=local_image_paths
+                )
 
-            return Response({
-                'gcs_image_urls': gcs_place_image_links,
-            }, status=HTTP_200_OK)
+                return Response({
+                    'gcs_image_urls': gcs_place_image_links,
+                }, status=HTTP_200_OK)
+
+        except Exception as e:
+            print(f"Error downloading images for place ID {place_id}: {e}")
+            return Response({'error': str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
 
 def serve_image(request, image_url):
     """Proxy image from Google's server."""
