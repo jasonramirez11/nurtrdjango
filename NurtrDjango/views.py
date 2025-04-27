@@ -3,7 +3,6 @@ import os
 import random
 import uuid
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from django.http import HttpResponse, StreamingHttpResponse
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import api_view, permission_classes, action
@@ -19,7 +18,7 @@ from django.contrib.auth import get_user_model
 import time  # Import time module for delay
 import requests
 from django.conf import settings
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK, HTTP_404_NOT_FOUND
+from rest_framework.status import HTTP_404_NOT_FOUND
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from django.http import JsonResponse
 import asyncio
@@ -30,13 +29,14 @@ from typing import List
 import asyncio
 import time
 from rest_framework.response import Response
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK, HTTP_429_TOO_MANY_REQUESTS
+from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK, HTTP_429_TOO_MANY_REQUESTS, HTTP_500_INTERNAL_SERVER_ERROR
 from rest_framework.views import APIView
 from rest_framework.parsers import JSONParser
 from rest_framework.permissions import AllowAny
 import aiohttp
 from dotenv import load_dotenv
 import os
+import traceback
 
 load_dotenv()
 IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
@@ -397,9 +397,6 @@ class PlacesAPIView(APIView):
 
             all_results = await self.fetch_place_images(all_results, max_images=1)
             all_results = [p for p in all_results if p.get("imagePlaces", [])]
-
-            # Make temporary directory for images
-            os.makedirs("temp_images", exist_ok=True)
 
             print(f"Getting or uploading images for {len(all_results)} places...")
 
@@ -769,7 +766,11 @@ class ImageDownloadAPIView(APIView):
         image_urls = request.data.get("image_urls")
         place_id = request.data.get("place_id")
         if not image_urls:
-            return Response({'error': 'No image URLs provided'}, status=HTTP_400_BAD_REQUEST)
+            response = Response({'error': 'No image URLs provided'}, status=HTTP_400_BAD_REQUEST)
+            response['Access-Control-Allow-Origin'] = '*'
+            response['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+            response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+            return response
 
         local_image_paths = []
         os.makedirs("temp_images", exist_ok=True)
@@ -779,9 +780,7 @@ class ImageDownloadAPIView(APIView):
             existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
             if existing_image_links:
                 print(f"Returning existing images for place ID {place_id}")
-                return Response({
-                    'gcs_image_urls': existing_image_links,
-                }, status=HTTP_200_OK)
+                response = Response({'gcs_image_urls': existing_image_links}, status=HTTP_200_OK)
             else:
                 print(f"Downloading images for place ID {place_id}...")
                 for image_url in image_urls:
@@ -795,13 +794,18 @@ class ImageDownloadAPIView(APIView):
                     image_paths=local_image_paths
                 )
 
-                return Response({
-                    'gcs_image_urls': gcs_place_image_links,
-                }, status=HTTP_200_OK)
+                response = Response({'gcs_image_urls': gcs_place_image_links}, status=HTTP_200_OK)
 
         except Exception as e:
             print(f"Error downloading images for place ID {place_id}: {e}")
-            return Response({'error': str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+            traceback.print_exc()
+            response = Response({'error': str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Add CORS headers to all responses
+        response['Access-Control-Allow-Origin'] = '*'
+        response['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
 
 def serve_image(request, image_url):
     """Proxy image from Google's server."""
