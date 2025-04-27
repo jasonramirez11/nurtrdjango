@@ -8,6 +8,7 @@ from NurtrDjango import settings
 from .views import PlacesAPIView, serve_image
 from django.http import HttpResponse
 from django.urls import get_resolver
+from .views import ImageDownloadAPIView
 
 def show_urls(request):
     """Temporary view to show all registered URLs."""
@@ -33,6 +34,7 @@ urlpatterns = [
     path('api/', include(router.urls)),  
     path('api/places/', PlacesAPIView.as_view(), name='places_api'),
     path('api/places/place-details/<str:place_id>/', PlacesAPIView.as_view(), name='place_details'),
+    path('api/image-download/', ImageDownloadAPIView.as_view(), name='image_download'),
     path('debug/urls/', show_urls),
     # Add a direct path to the authenticate endpoint as a fallback
     re_path(r'^api/users/authenticate/$', UserViewSet.as_view({'post': 'authenticate'}), name='user-authenticate'),

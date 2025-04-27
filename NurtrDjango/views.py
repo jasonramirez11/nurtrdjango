@@ -1,16 +1,9 @@
 import json
 import os
 import uuid
-import django.views.generic
-from django.contrib.auth import get_user_model
-from django.contrib.staticfiles import finders
-from django.core.files.base import ContentFile
-from django.core.mail import send_mail, EmailMessage
-from django.db.models import Q
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from django.http import HttpResponse, StreamingHttpResponse
-from django.template.loader import get_template
-from django.utils import timezone
-from django.utils.html import strip_tags
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -20,24 +13,35 @@ from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
 from rest_framework.generics import get_object_or_404
 import users.serializers as app_serializers
-import NurtrDjango.models as app_models
-from NurtrDjango.utils import strip_non_model_fields
 from rest_framework.decorators import action
 from django.contrib.auth import get_user_model
 import time  # Import time module for delay
 import requests
 from django.conf import settings
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK
+from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK, HTTP_404_NOT_FOUND
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from django.http import JsonResponse
 import asyncio
-
-
+from django.core.cache import cache # Add cache import
+from google.cloud.storage import Client, transfer_manager
+from google.cloud import exceptions
+from typing import List
 import asyncio
-import aiohttp
 import time
 from rest_framework.response import Response
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK
+from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK, HTTP_429_TOO_MANY_REQUESTS
+from rest_framework.views import APIView
+from rest_framework.parsers import JSONParser
+from rest_framework.permissions import AllowAny
+import aiohttp
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
+IMAGE_DOWNLOAD_URL = os.getenv("IMAGE_DOWNLOAD_URL")
+
+storage_client = Client()
 
 User = get_user_model()
 
@@ -74,6 +78,7 @@ class UserViewSet(viewsets.ModelViewSet):
         user_data = app_serializers.UserSerializer(user, context={'request': request}).data
         user_data['token'] = token.key 
 
+        print("user_data", user_data)
         return Response(user_data, status=status.HTTP_200_OK)
 
     def create(self, request, *args, **kwargs):
@@ -99,14 +104,153 @@ class UserViewSet(viewsets.ModelViewSet):
 
         return Response(user_data, status=status.HTTP_201_CREATED)
 
-import asyncio
-import aiohttp
-import time
-from rest_framework.response import Response
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_200_OK
-from rest_framework.views import APIView
-from rest_framework.parsers import JSONParser
-from rest_framework.permissions import AllowAny
+# Define constants for rate limiting
+MAX_UNAUTHENTICATED_REQUESTS_PER_IP = 5
+CACHE_TIMEOUT_SECONDS = None
+
+def set_cors_for_get(bucket_name):
+    """Sets a bucket's CORS policies to allow GET requests from any origin."""
+    # bucket_name = "your-bucket-name"
+
+    storage_client = Client()
+    bucket = storage_client.get_bucket(bucket_name) # Use get_bucket for existence check
+
+    # Define the CORS rule for GET requests
+    cors_rule = {
+        "origin": ["*"], # Allow any origin
+        "method": ["GET"], # Allow only GET method
+        "responseHeader": ["Content-Type"], # Allow browser access to Content-Type header
+        "maxAgeSeconds": 3600 # Cache preflight response for 1 hour
+    }
+
+    # Assign the list containing the rule to the bucket's cors property
+    bucket.cors = [cors_rule]
+
+    # Patch the bucket to apply the change
+    bucket.patch()
+
+    print(f"Set CORS policies for bucket {bucket.name}: {bucket.cors}")
+    return bucket
+
+def upload_single_image_threaded(blob, local_path):
+    """Helper synchronous function to be run in a thread."""
+    try:
+        blob.upload_from_filename(local_path)
+        print(f"Successfully uploaded {local_path} to {blob.name}")
+        # Make the blob publicly viewable (optional, adjust as needed)
+        # blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        print(f"Error uploading {local_path} to {blob.name}: {e}")
+        return None # Indicate failure
+
+def upload_place_images_to_bucket(
+    bucket_name, place_id, image_paths
+):
+    """Upload local image files for a specific place into a place-specific folder
+    within a bucket, concurrently.
+
+    Args:
+        bucket_name (str): The ID of your GCS bucket.
+        place_id (str): The unique identifier for the place (e.g., Google Place ID).
+        image_paths (list[str]): A list of local file paths to the images for this place.
+        workers (int): The maximum number of processes/threads to use.
+    """
+    print(f"Uploading images for Place ID '{place_id}' to bucket '{bucket_name}'...")
+
+    bucket = storage_client.bucket(bucket_name)
+
+    # Define the prefix for the place ID folder
+    prefix = f"places/{place_id}/"
+
+    # List and delete existing blobs in the place ID folder
+    blobs_to_delete = bucket.list_blobs(prefix=prefix)
+    for blob in blobs_to_delete:
+        print(f"Deleting existing blob: {blob.name}")
+        blob.delete()
+
+    upload_tasks = []
+    gcs_links = []
+    for local_file_path in image_paths:
+        original_filename = os.path.basename(local_file_path)
+        destination_blob_name = f"places/{place_id}/{original_filename}"
+        blob = bucket.blob(destination_blob_name)
+        #uploads.append((local_file_path, blob))
+        # Create a coroutine to run the synchronous upload in a thread
+        #task = asyncio.to_thread(upload_single_image_threaded, blob, local_file_path)
+        upload_tasks.append((blob, local_file_path))
+
+    if not upload_tasks:
+        print(f"No valid image paths found to upload for Place ID '{place_id}'.")
+        return []
+
+    start_time = time.time()
+    print(f"Starting concurrent upload of {len(upload_tasks)} images for Place ID '{place_id}'...")
+
+    # Use ThreadPoolExecutor for synchronous concurrent uploads
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=min(len(upload_tasks), 10)) as executor:
+        futures = [executor.submit(upload_single_image_threaded, blob, local_path) for blob, local_path in upload_tasks]
+        results = [future.result() for future in as_completed(futures)]
+
+    # Process results
+    for result in results:
+        if result:
+            gcs_links.append(result)
+
+    end_time = time.time()
+    print(f"Finished uploading for Place ID '{place_id}'.")
+    print(f"Total time for {len(gcs_links)} successful uploads: {end_time - start_time:.2f} seconds")
+    return gcs_links
+
+    """
+    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+    # Process results
+    for result in results:
+        if isinstance(result, Exception):
+            # Log the exception if gather caught one
+            print(f"An exception occurred during upload: {result}")
+        elif result:  # Check if the result is a URL (not None)
+            gcs_links.append(result)
+        # Else: upload_single_image_threaded returned None due to an error already printed
+
+    end_time = time.time()
+    print(f"Finished uploading for Place ID '{place_id}'.")
+    print(f"Total time for {len(gcs_links)} successful uploads: {end_time - start_time:.2f} seconds")
+    return gcs_links
+    """
+
+def download_image(image_url, local_file_path):
+    """Download the image and save locally."""
+    response = requests.get(image_url)
+    with open(local_file_path, "wb") as f:
+        f.write(response.content)
+
+def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
+    """
+    Check if images for the given place_id exist in the specified GCS bucket.
+
+    Args:
+        bucket_name (str): The name of the GCS bucket.
+        place_id (str): The ID of the place to check.
+
+    Returns:
+        List[str]: A list of existing image URLs if found, otherwise an empty list.
+    """
+    print(f"Checking for existing images in bucket '{bucket_name}' for Place ID '{place_id}'...")
+    start_time = time.time()
+    storage_client = Client()
+    bucket = storage_client.bucket(bucket_name)
+    prefix = f"places/{place_id}/"  # Assuming images are stored under a folder named after the place_id
+
+    blobs = bucket.list_blobs(prefix=prefix)  # List blobs with the specified prefix
+    existing_images = [blob.public_url for blob in blobs]  # Adjust based on your image format
+
+    end_time = time.time()
+    print(f"Finished checking for existing images for Place ID '{place_id}'.")
+    print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
+    return existing_images
 
 class PlacesAPIView(APIView):
     permission_classes = [AllowAny]
@@ -119,6 +263,15 @@ class PlacesAPIView(APIView):
     BASE_URL = "https://places.googleapis.com/v1/places:searchNearby"
     DETAILS_URL = "https://places.googleapis.com/v1/places/"
     GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+    def get_client_ip(self, request):
+        """Utility function to get client IP address."""
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+        return ip
 
     async def get_coordinates_from_zip(self, zip_code):
         """Fetch latitude and longitude from ZIP code using Geocoding API."""
@@ -139,6 +292,22 @@ class PlacesAPIView(APIView):
 
     def post(self, request):
         start_time = time.time()
+
+        #set_cors_for_get('nurtr-places')
+
+        #print('places request ', request.data)
+        print('user is authenticated', request.data.get('is_authenticated', False))
+        
+        # Rate limiting for unauthenticated users
+        if not request.data.get('is_authenticated', False):
+            rate_limit_response = self.check_rate_limit(
+                request, 
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP, 
+                CACHE_TIMEOUT_SECONDS
+            )
+            if rate_limit_response:
+                return rate_limit_response
+
         data = request.data
         zip_code = data.get("zip_code")  # Get ZIP code if provided
         latitude = data.get("latitude", 40.712776)
@@ -151,7 +320,7 @@ class PlacesAPIView(APIView):
         page = int(data.get("page", 1))
         #items_per_page = 4
 
-        print('places request ', request)
+        #print('places request ', request)
         if zip_code:
             #print(f"zip code: {zip_code} {type(zip_code)}")
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
@@ -176,7 +345,6 @@ class PlacesAPIView(APIView):
         # Run asynchronous I/O using asyncio and aiohttp
         detailed_results = asyncio.run(self.async_main(params, filters, min_price, max_price))
 
-        import math
         def haversine(lat1, lon1, lat2, lon2):
             """
             Calculate the great-circle distance between two points on the Earth using the Haversine formula.
@@ -240,7 +408,45 @@ class PlacesAPIView(APIView):
 
             all_results = await self.fetch_place_images(all_results)
             all_results = [p for p in all_results if p.get("imagePlaces", [])]
-            #detailed_results = await self.async_fetch_all_place_details(all_results, filters, min_price, max_price, session)
+
+            # Make temporary directory for images
+            os.makedirs("temp_images", exist_ok=True)
+
+            print(f"Getting or uploading images for {len(all_results)} places...")
+
+            async def process_place(place):
+                print(f"Processing place ID {place['id']}...")
+                place_id = place["id"]
+                image_places = place.get("imagePlaces", [])[:3]  # Limit to first 3 photos
+
+                if not image_places:
+                    print(f"No images found for place ID {place_id}")
+                    return place
+
+                data = {'image_urls': image_places, 'place_id': place["id"]}
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(IMAGE_DOWNLOAD_URL, json=data, timeout=15) as response:
+                            if response.status == 200:
+                                response_data = await response.json()
+                                print(f"Image download successful for place ID {place['id']}")
+                                place["imagePlaces"] = response_data.get("gcs_image_urls", [])
+                            else:
+                                print(f"Image download failed for place ID {place['id']}: {response.status}")
+                                place["imagePlaces"] = []
+                except Exception as e:
+                    print(f"Error during image download for place ID {place['id']}: {e}")
+                    place["imagePlaces"] = []
+
+                return place
+
+            start_time = time.time()
+            all_results = await asyncio.gather(*[process_place(place) for place in all_results])
+            end_time = time.time()
+
+            execution_time = round((end_time - start_time) * 1000, 2)
+            print(f"Finished processing images for {len(all_results)} places. Execution time: {execution_time} ms")
         
         #print(f'all plcace results: {len(all_results)}')
         return all_results
@@ -261,25 +467,64 @@ class PlacesAPIView(APIView):
         async with session.get(url, headers=headers) as response:
             details_data = await response.json()
         
-        photos = details_data.get("photos", [])[:3]  # Limit to first 5 photos
-        image_places = []
+        #photos = details_data.get("photos", [])[:3]  # Limit to first 5 photos
+        #image_places = []
 
+        def process_place(place):
+            print(f"Processing place ID {place['id']}...")
+            place_id = place["id"]
+            image_photos = place.get("photos", [])[:3]
+
+            if not image_photos:
+                print(f"No images found for place ID {place_id}")
+                return place
+
+            data = {'image_urls': image_photos, 'place_id': place["id"]}
+
+            try:
+                response = requests.post(IMAGE_DOWNLOAD_URL, json=data)
+                if response.status_code == 200:
+                    print(f"Image download successful for place ID {place['id']}")
+                    place["images"] = response.json().get("gcs_image_urls", [])
+                else:
+                    print(f"Image download failed for place ID {place['id']}: {response.status_code}")
+                    place["images"] = []
+            except Exception as e:
+                print(f"Error during image download for place ID {place['id']}: {e}")
+                place["images"] = []
+
+            return place
+
+        return process_place(details_data)
+
+        """
         for photo in photos:
             name = photo.get("name")
             if name:
                 image_url = f"https://places.googleapis.com/v1/{name}/media?key={self.API_KEY}&maxHeightPx=600"
                 #proxied_image_url = f"/api/serve-image?url={google_image_url}"  # Proxy through your backend
                 image_places.append(image_url)
-
         details_data["images"] = image_places  # Attach new key
+        """
 
-        return details_data
-
-    def get(self, request, place_id=None):
+    def get(self, request, place_id=None, is_authenticated=False):
         """Endpoint to fetch place details by ID."""
         if not place_id:
             return Response({"error": "Place ID is required"}, status=HTTP_400_BAD_REQUEST)
 
+        print('request query params', request.query_params)
+        is_authenticated = request.query_params.get('is_authenticated', 'false').lower() == 'true'
+
+        # Rate limiting for unauthenticated users
+        if not is_authenticated:
+            rate_limit_response = self.check_rate_limit(
+                request, 
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP, 
+                CACHE_TIMEOUT_SECONDS
+            )
+            if rate_limit_response:
+                return rate_limit_response
+            
         async def fetch_details():
             async with aiohttp.ClientSession() as session:
                 return await self.async_fetch_place_details(place_id, session)
@@ -388,7 +633,44 @@ class PlacesAPIView(APIView):
         #print(f"Place details results: {results}")
 
         filtered_places = [res for res in results if res]
-        filtered_places = await self.fetch_place_images(filtered_places, session)
+        filtered_places = await self.fetch_place_images(filtered_places)
+
+        for place in filtered_places:
+            image_places = place.get("imagePlaces", [])
+
+            if not image_places:
+                place["imagePlaces"] = []
+
+            data = {'image_urls': image_places, 'place_id': place["id"]}
+
+            try:
+                response = requests.post(IMAGE_DOWNLOAD_URL, json=data)
+                if response.status_code == 200:
+                    print(f"Image download successful for place ID {place['id']}")
+                    place["imagePlaces"] = response.json().get("gcs_image_urls", [])
+                else:
+                    print(f"Image download failed for place ID {place['id']}: {response.status_code}")
+                    place["imagePlacesGCS"] = []
+            except Exception as e:
+                print(f"Error during image download for place ID {place['id']}: {e}")
+                place["imagePlaces"] = []
+
+            """
+            local_image_paths = []
+            for image_place in image_places:
+                # Download the image and save locally
+                local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
+                await self.download_image(image_place, local_file_path)
+                local_image_paths.append(local_file_path)
+
+            gcs_place_image_links = upload_place_images_to_bucket(
+                bucket_name='nurtr-places',
+                place_id=place["id"],
+                image_paths=local_image_paths
+            )
+
+            place["imagePlacesGCS"] = gcs_place_image_links
+            """
 
         return filtered_places
 
@@ -405,10 +687,6 @@ class PlacesAPIView(APIView):
                     image_url = f"https://places.googleapis.com/v1/{name}/media?key={self.API_KEY}&maxHeightPx=600"
                     #proxied_image_url = f"/api/serve-image?url={google_image_url}"  # Proxy through your backend
                     image_places.append(image_url)
-
-            #print('image place 1', image_places[0])
-            #print('\nimage place 2', image_places[1])
-            #print('\nimage place 3', image_places[2])
 
             print(f"num distinct photos: {len(set(image_places))}")
 
@@ -436,6 +714,99 @@ class PlacesAPIView(APIView):
                 return False
 
         return True
+
+    def check_rate_limit(self, request, max_requests, cache_timeout=None):
+        """
+        Enforces rate limiting for unauthenticated requests.
+        
+        Args:
+            request: The Django request object.
+            max_requests: The maximum number of allowed requests.
+            cache_timeout: The timeout for the cache key (in seconds). If None, the key will not expire.
+        
+        Returns:
+            Response: A 429 response if the rate limit is exceeded, otherwise None.
+        """
+        ip_address = self.get_client_ip(request)
+
+        country_cache_key = f"ip_country_{ip_address}"
+        country = cache.get(country_cache_key)
+        if not country:
+            try:
+                url = f"https://ipinfo.io/json?token={IP_INFO_API_TOKEN}"
+                response = requests.get(url)
+                print(f"IP info response: {response.json()}")
+                if response.status_code == 200:
+                    data = response.json()
+                    country = data.get("country", "Unknown")
+                    print(f"Country for IP {ip_address}: {country}")
+                    cache.set(country_cache_key, country, timeout=cache_timeout)
+                else:
+                    # If API call fails, assume allowed to avoid blocking legitimate users
+                    country = 'US'
+            except Exception as e:
+                print(f"Error checking IP country for {ip_address}: {e}")
+                country = 'US'
+        else:
+            print(f"Cached country for IP {ip_address}: {country}")
+
+        # Block requests not from the US
+        if country != 'US':
+            return Response(
+                {"error": "Access restricted to US-based users only."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        cache_key = f"places_api_requests_{ip_address}"
+        request_count = cache.get(cache_key, 0)
+
+        if request_count > max_requests:
+            return Response(
+                {"error": "Request limit reached for unauthenticated users. Please sign in to continue."},
+                status=HTTP_429_TOO_MANY_REQUESTS
+            )
+        
+        # Increment count and set cache with the specified timeout
+        cache.set(cache_key, request_count + 1, timeout=cache_timeout)
+        print(f"Unauthenticated request from IP {ip_address}. Count: {request_count + 1}")
+        return None
+
+class ImageDownloadAPIView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        """Endpoint to download images."""
+        image_urls = request.data.get("image_urls")
+        place_id = request.data.get("place_id")
+        if not image_urls:
+            return Response({'error': 'No image URLs provided'}, status=HTTP_400_BAD_REQUEST)
+
+        local_image_paths = []
+
+        # Check for existing images
+        existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
+        if existing_image_links:
+            print(f"Returning existing images for place ID {place_id}")
+            return Response({
+                'gcs_image_urls': existing_image_links,
+            }, status=HTTP_200_OK)
+        else:
+            print(f"Downloading images for place ID {place_id}...")
+            for image_url in image_urls:
+                local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
+                download_image(image_url, local_file_path)
+                local_image_paths.append(local_file_path)
+
+            gcs_place_image_links = upload_place_images_to_bucket(
+                bucket_name='nurtr-places',
+                place_id=place_id,
+                image_paths=local_image_paths
+            )
+
+            return Response({
+                'gcs_image_urls': gcs_place_image_links,
+            }, status=HTTP_200_OK)
 
 def serve_image(request, image_url):
     """Proxy image from Google's server."""

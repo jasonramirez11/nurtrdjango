@@ -250,3 +250,21 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# --- Caching Configuration ---
+# Use environment variables set in Cloud Run for Redis host/port
+# Default to localhost:6379 if environment variables are NOT set
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = os.environ.get('REDIS_PORT', '6379')
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        # Uses the variables defined above
+        'LOCATION': f'redis://{REDIS_HOST}:{REDIS_PORT}/0', # Using DB 1
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        }
+    }
+}
+# --- End Caching Configuration ---
