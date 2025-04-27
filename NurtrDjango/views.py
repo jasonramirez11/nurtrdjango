@@ -41,6 +41,7 @@ import traceback
 load_dotenv()
 IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
 IMAGE_DOWNLOAD_URL = os.getenv("IMAGE_DOWNLOAD_URL")
+TESTING = os.getenv("TESTING", True)
 
 storage_client = Client()
 
@@ -210,11 +211,20 @@ def upload_place_images_to_bucket(
     return gcs_links
 
 
-def download_image(image_url, local_file_path):
-    """Download the image and save locally."""
-    response = requests.get(image_url)
-    with open(local_file_path, "wb") as f:
-        f.write(response.content)
+def download_image(image_url):
+    local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
+    try:
+        response = requests.get(image_url, timeout=10)  # Set a timeout for the request
+        if response.status_code == 200:
+            with open(local_file_path, 'wb') as f:
+                f.write(response.content)
+            return local_file_path
+        else:
+            print(f"Failed to download {image_url}: Status {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Error downloading {image_url}: {str(e)}")
+        return None
 
 def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
     """
@@ -559,7 +569,7 @@ class PlacesAPIView(APIView):
                     }
                 },
                 "includedTypes": group_types,
-                "maxResultCount": 17,
+                "maxResultCount": 5 if TESTING else 17,
             }
 
             all_results = []
@@ -783,10 +793,10 @@ class ImageDownloadAPIView(APIView):
                 response = Response({'gcs_image_urls': existing_image_links}, status=HTTP_200_OK)
             else:
                 print(f"Downloading images for place ID {place_id}...")
-                for image_url in image_urls:
-                    local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
-                    download_image(image_url, local_file_path)
-                    local_image_paths.append(local_file_path)
+                local_image_paths = []
+                with ThreadPoolExecutor(max_workers=5) as executor:  # Adjust max_workers as needed
+                    results = executor.map(download_image, image_urls)
+                    local_image_paths.extend(filter(None, results))  # Filter out None values from failed downloads
 
                 gcs_place_image_links = upload_place_images_to_bucket(
                     bucket_name='nurtr-places',
