@@ -783,6 +783,7 @@ class ImageDownloadAPIView(APIView):
             return Response({'error': 'No image URLs provided'}, status=HTTP_400_BAD_REQUEST)
 
         local_image_paths = []
+        os.makedirs("temp_images", exist_ok=True)
 
         # Check for existing images
         existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
