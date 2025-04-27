@@ -39,9 +39,12 @@ import os
 import traceback
 
 load_dotenv()
+
 IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
 IMAGE_DOWNLOAD_URL = os.getenv("IMAGE_DOWNLOAD_URL")
-TESTING = os.getenv("TESTING", True)
+TESTING = os.getenv("TESTING", "False").lower() == "true"
+
+print(f"TESTING {os.getenv('TESTING')}")
 
 storage_client = Client()
 
@@ -109,6 +112,7 @@ class UserViewSet(viewsets.ModelViewSet):
 # Define constants for rate limiting
 MAX_UNAUTHENTICATED_REQUESTS_PER_IP = 5
 CACHE_TIMEOUT_SECONDS = None
+
 
 def set_cors_for_get(bucket_name):
     """Sets a bucket's CORS policies to allow GET requests from any origin."""
@@ -251,6 +255,60 @@ def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
     print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
     return existing_images
 
+def process_images_for_place(place_id, image_urls):
+    """
+    Process and download images for a place (synchronous).
+    This entire function runs in a worker thread.
+    
+    Args:
+        place_id (str): The place ID.
+        image_urls (list): List of image URLs to process.
+        
+    Returns:
+        list: Processed image URLs from GCS.
+    """
+    if not image_urls:
+        print(f"No image URLs provided for place ID {place_id}")
+        return []
+        
+    try:
+        # Check for existing images first
+        existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
+        
+        if existing_image_links:
+            print(f"Using existing images for place ID {place_id}")
+            return existing_image_links
+            
+        # Create temp directory if needed
+        os.makedirs("temp_images", exist_ok=True)
+        
+        # Download images sequentially (since the entire function is already in a thread)
+        local_image_paths = []
+        for url in image_urls:
+            path = download_image(url)
+            if path:
+                local_image_paths.append(path)
+        
+        print(f"Successfully downloaded {len(local_image_paths)} images locally for place ID {place_id}")
+        
+        # Upload to GCS if we have local images
+        if local_image_paths:
+            gcs_image_urls = upload_place_images_to_bucket(
+                bucket_name='nurtr-places',
+                place_id=place_id,
+                image_paths=local_image_paths
+            )
+            return gcs_image_urls
+        else:
+            print(f"No images were successfully downloaded for place ID {place_id}")
+            return []
+            
+    except Exception as e:
+        print(f"Error processing images for place ID {place_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+    
 class PlacesAPIView(APIView):
     permission_classes = [AllowAny]
     parser_classes = [JSONParser]
@@ -410,6 +468,7 @@ class PlacesAPIView(APIView):
 
             print(f"Getting or uploading images for {len(all_results)} places...")
 
+            """
             async def process_place(place):
                 print(f"Processing place ID {place['id']}...")
                 place_id = place["id"]
@@ -436,11 +495,38 @@ class PlacesAPIView(APIView):
                     place["imagePlaces"] = []
 
                 return place
-
+            
             start_time = time.time()
             all_results = await asyncio.gather(*[process_place(place) for place in all_results])
             end_time = time.time()
+            """
 
+            start_time = time.time()
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                # Prepare processing tasks for all places
+                future_to_place = {}
+                for place in all_results:
+                    image_urls = place.get("imagePlaces", [])[:3]
+                    if image_urls:
+                        future = executor.submit(
+                            process_images_for_place, 
+                            place["id"], 
+                            image_urls
+                        )
+                        future_to_place[future] = place
+                
+                # Process completed tasks as they finish
+                for future in as_completed(future_to_place):
+                    place = future_to_place[future]
+                    try:
+                        processed_urls = future.result()
+                        place["imagePlaces"] = processed_urls
+                        print(f"Processed {len(processed_urls)} images for place {place['id']}")
+                    except Exception as e:
+                        print(f"Error processing place {place['id']}: {e}")
+                        place["imagePlaces"] = []
+
+            end_time = time.time()
             execution_time = round((end_time - start_time) * 1000, 2)
             print(f"Finished processing images for {len(all_results)} places. Execution time: {execution_time} ms")
         
@@ -571,6 +657,8 @@ class PlacesAPIView(APIView):
                 "includedTypes": group_types,
                 "maxResultCount": 5 if TESTING else 17,
             }
+
+            print(f"max result count is {5 if TESTING else 17}")
 
             all_results = []
             next_page_token = None
