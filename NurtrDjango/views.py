@@ -255,7 +255,7 @@ def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
     print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
     return existing_images
 
-def process_images_for_place(place_id, image_urls):
+def process_images_for_place(place_id, image_urls, min_images=1):
     """
     Process and download images for a place (synchronous).
     This entire function runs in a worker thread.
@@ -273,9 +273,12 @@ def process_images_for_place(place_id, image_urls):
         
     try:
         # Check for existing images first
-        existing_image_links = check_existing_images(bucket_name='nurtr-places', place_id=place_id)
+        existing_image_links = check_existing_images(
+            bucket_name='nurtr-places', 
+            place_id=place_id
+        )
         
-        if existing_image_links:
+        if existing_image_links and len(existing_image_links) >= min_images:
             print(f"Using existing images for place ID {place_id}")
             return existing_image_links
             
@@ -284,13 +287,18 @@ def process_images_for_place(place_id, image_urls):
         
         # Download images sequentially (since the entire function is already in a thread)
         local_image_paths = []
-        for url in image_urls:
-            path = download_image(url)
-            if path:
-                local_image_paths.append(path)
+        with ThreadPoolExecutor(max_workers=min(10, len(image_urls))) as inner_executor:
+            # Map the download_image function over all image URLs concurrently
+            download_futures = {inner_executor.submit(download_image, url): url for url in image_urls}
+            
+            # Process results as they complete
+            for future in as_completed(download_futures):
+                path = future.result()
+                if path:
+                    local_image_paths.append(path)
         
         print(f"Successfully downloaded {len(local_image_paths)} images locally for place ID {place_id}")
-        
+
         # Upload to GCS if we have local images
         if local_image_paths:
             gcs_image_urls = upload_place_images_to_bucket(
@@ -556,7 +564,12 @@ class PlacesAPIView(APIView):
             print(f"Processing place ID {place['id']}...")
             place_id = place["id"]
             image_photos = place.get("photos", [])[:3]
+            image_urls = [f"https://places.googleapis.com/v1/{photo.get('name','')}/media?key={self.API_KEY}&maxHeightPx=600" for photo in image_photos if photo.get('name')]
 
+            place['images'] = process_images_for_place(place_id, image_urls, min_images=3)
+            return place
+            
+            """
             if not image_photos:
                 print(f"No images found for place ID {place_id}")
                 return place
@@ -576,6 +589,7 @@ class PlacesAPIView(APIView):
                 place["images"] = []
 
             return place
+            """
 
         return process_place(details_data)
 
