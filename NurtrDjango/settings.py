@@ -43,7 +43,7 @@ ALLOWED_HOSTS = [
 
 # For local development
 if DEBUG:
-    ALLOWED_HOSTS += ['0.0.0.0', 'localhost']
+    ALLOWED_HOSTS += ['0.0.0.0', 'localhost', '192.168.1.169']
 
 # Security settings
 if not DEBUG:

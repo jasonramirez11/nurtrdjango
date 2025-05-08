@@ -1,5 +1,3 @@
-import json
-import os
 import random
 import uuid
 import math
@@ -37,12 +35,17 @@ import aiohttp
 from dotenv import load_dotenv
 import os
 import traceback
+import serpapi
+from .models import Place # Import the Place model
+from django.core.exceptions import ObjectDoesNotExist
+from asgiref.sync import sync_to_async
 
 load_dotenv()
 
 IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
 IMAGE_DOWNLOAD_URL = os.getenv("IMAGE_DOWNLOAD_URL")
 TESTING = os.getenv("TESTING", "False").lower() == "true"
+SERP_API_KEY = os.getenv("SERP_API_KEY")
 
 print(f"TESTING {os.getenv('TESTING')}")
 
@@ -145,7 +148,7 @@ def upload_single_image_threaded(blob, local_path):
     for _ in range(max_attempts):
         try:
             blob.upload_from_filename(local_path)
-            print(f"Successfully uploaded {local_path} to {blob.name}")
+            #print(f"Successfully uploaded {local_path} to {blob.name}")
             # Make the blob publicly viewable (optional, adjust as needed)
             # blob.make_public()
             return blob.public_url
@@ -255,23 +258,97 @@ def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
     print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
     return existing_images
 
-def process_images_for_place(place_id, image_urls, min_images=1):
+
+def get_images_from_serp(place_image_link, max_images=1):
+    """
+    Extract image URLs from the SERP API response.
+
+    Args:
+        place_image_link (str): The link to the place's images.
+
+    Returns:
+        list: List of image URLs.
+    """
+    print(f"Fetching images from SERP API for link: {place_image_link}")
+    try:
+        api_key = os.environ.get('SERP_API_KEY')
+
+        params = {'api_key': api_key}
+
+        response = requests.get(place_image_link, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            image_urls = [image_data['image'] for image_data in data.get('photos', []) if image_data.get('image')][:max_images]
+            print(f"Fetched {len(image_urls)} images from SERP API.")
+            return image_urls
+        else:
+            print(f"Failed to fetch images from SERP API: Status {response.status_code}, Response: {response.text}")
+            return []
+    except Exception as e:
+        print(f"Error fetching images from SERP API: {str(e)}")
+        return []
+
+def get_reviews_from_serp(place_id, max_reviews=5):
+    """
+    Extract review URLs from the SERP API response.
+
+    Args:
+        review_link (str): The link to the place's reviews.
+
+    Returns:
+        list: List of review URLs.
+    """
+    print(f"Fetching reviews from SERP API for place ID: {place_id}")
+    try:
+
+        params = {
+            "engine": "google_maps_reviews",
+            "hl": "en",
+            "api_key": SERP_API_KEY,
+            "place_id": place_id
+        }
+
+        start_time = time.time()
+        results = serpapi.search(params).get('reviews', [])[:max_reviews]
+        end_time = time.time()
+
+        print(f"Total time for fetching {len(results)} reviews: {end_time - start_time:.2f} seconds")
+
+        print(f"Fetched {len(results)} reviews from SERP API.")
+        return results
+    except Exception as e:
+        print(f"Error fetching reviews from SERP API: {str(e)}")
+        return []
+
+def process_images_for_place(place, min_images=1):
     """
     Process and download images for a place (synchronous).
     This entire function runs in a worker thread.
     
     Args:
         place_id (str): The place ID.
-        image_urls (list): List of image URLs to process.
         
     Returns:
         list: Processed image URLs from GCS.
     """
-    if not image_urls:
-        print(f"No image URLs provided for place ID {place_id}")
-        return []
         
     try:
+        print(f"Processing images for place: {place.get('place_id', place.get('id'))}")
+
+        if min_images == 1:
+            max_images = 1
+        else:
+            max_images = 5
+
+        image_urls = get_images_from_serp(place["photos_link"], max_images=max_images)
+
+        if not image_urls:
+            print(f"No image URLs found for place ID {place.get('place_id', place.get('id'))}")
+            return []
+
+        place_id = place.get('place_id', place.get('id'))
+
         # Check for existing images first
         existing_image_links = check_existing_images(
             bucket_name='nurtr-places', 
@@ -316,7 +393,7 @@ def process_images_for_place(place_id, image_urls, min_images=1):
         import traceback
         traceback.print_exc()
         return []
-    
+
 class PlacesAPIView(APIView):
     permission_classes = [AllowAny]
     parser_classes = [JSONParser]
@@ -362,12 +439,12 @@ class PlacesAPIView(APIView):
 
         #print('places request ', request.data)
         print('user is authenticated', request.data.get('is_authenticated', False))
-        
+
         # Rate limiting for unauthenticated users
         if not request.data.get('is_authenticated', False):
             rate_limit_response = self.check_rate_limit(
-                request, 
-                MAX_UNAUTHENTICATED_REQUESTS_PER_IP, 
+                request,
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP,
                 CACHE_TIMEOUT_SECONDS
             )
             if rate_limit_response:
@@ -378,7 +455,7 @@ class PlacesAPIView(APIView):
         latitude = data.get("latitude", 40.712776)
         longitude = data.get("longitude", -74.005974)
         radius = data.get("radius", 500)
-        types = data.get("types", [])
+        types = data.get("types", {})
         min_price = data.get("minPrice", 0)
         max_price = data.get("maxPrice", 500)
         filters = data.get("filters", [])
@@ -391,7 +468,7 @@ class PlacesAPIView(APIView):
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
             if not latitude or not longitude:
                 return Response({"error": "Invalid ZIP code or location not found"}, status=HTTP_400_BAD_REQUEST)
-        
+
         if not latitude or not longitude:
             return Response({"error": "Latitude and Longitude are required"}, status=HTTP_400_BAD_REQUEST)
 
@@ -400,208 +477,621 @@ class PlacesAPIView(APIView):
             "radius": radius,
             "key": self.API_KEY,
         }
-        
+
         if types:
             params["types"] = types
-            print(f"num types {len(types)}")
+            print(f"num types {len(types.keys())}")
 
         print(f"Params: {params}") # OK HERE
 
-        # Run asynchronous I/O using asyncio and aiohttp
-        detailed_results = asyncio.run(self.async_main(params, filters, min_price, max_price))
+        # Run asynchronous I/O to get place details from external API
+        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price))
 
+        processed_results = [] # List to store final results (from DB or API)
+
+        # Haversine function for distance calculation (moved outside the loop)
         def haversine(lat1, lon1, lat2, lon2):
-            """
-            Calculate the great-circle distance between two points on the Earth using the Haversine formula.
-            Returns distance in miles.
-            """
-            # Radius of the Earth in miles
-            R = 3958.8
-
-            # Convert latitude and longitude from degrees to radians
-            lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-
-            # Differences in coordinates
+            if None in [lat1, lon1, lat2, lon2]: # Handle potential None values
+                 return None
+            R = 3958.8 # Radius of the Earth in miles
+            lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)]) # Ensure floats before radians
             dlat = lat2 - lat1
             dlon = lon2 - lon1
-
-            # Haversine formula
             a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
             c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-            # Distance in miles
             distance = R * c
-            return distance
-        
-        # Calculate and store distance for each result
-        for result in detailed_results:
-            if "location" in result and "latitude" in result["location"] and "longitude" in result["location"]:
-                result_lat = result["location"]["latitude"]
-                result_lon = result["location"]["longitude"]
-                origin_lat = latitude
-                origin_lon = longitude
-                
-                # Calculate distance using Haversine formula
-                distance = haversine(origin_lat, origin_lon, result_lat, result_lon)
-                
-                # Store distance in the result
-                result["distance"] = round(distance, 2)  # Round to 2 decimal places
+            return round(distance, 2)
 
-        #print(f"Detailed Results: {detailed_results}")
+        # Process each result from the API
+        for api_result in api_results:
+            place_id = api_result.get("place_id")
+            if not place_id:
+                continue # Skip if no place_id
 
-        # Apply pagination AFTER filtering
-        total_filtered_results = len(detailed_results)
-        #start_idx = (page - 1) * items_per_page
-        #paginated_results = detailed_results[start_idx : start_idx + items_per_page]
-        paginated_results = detailed_results
+            try:
+                # Check if place exists in DB - use a direct function call with sync_to_async
+                # instead of await
+                get_place = sync_to_async(Place.objects.get)
+                try:
+                    place = asyncio.run(get_place(place_id=place_id))
+                    print(f"Found place in DB: {place_id}")
+
+                    # Use DB data, construct dictionary matching API structure (or desired output)
+                    place_data = {
+                        "place_id": place.place_id,
+                        "title": place.title,
+                        "description": place.description,
+                        "data_id": place.data_id,
+                        "reviews_link": place.reviews_link,
+                        "photos_link": place.photos_link,
+                        "location": { # Reconstruct location structure
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None,
+                        },
+                        "gps_coordinates": { # Add gps_coordinates if needed by frontend
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None,
+                        },
+                        "type": place.type,
+                        "types": place.types,
+                        "address": place.address,
+                        "extensions": place.extensions,
+                        "displayName": {"text": place.display_name} if place.display_name else None, # Reconstruct display name
+                        "formattedAddress": place.formatted_address,
+                        "rating": place.rating,
+                        "reviews": place.reviews, # This is review count
+                        "operating_hours": place.hours, # Use stored hours
+                        "place_images": place.place_images,
+                        "reviews_list": place.reviews_list, # This is the list of reviews
+                        "popular_times": place.popular_times,
+                        "category": place.category,  # Include category in response
+                        # Add other fields from the model as needed
+                    }
+                    # Calculate distance using DB coordinates and request location
+                    db_lat = float(place.latitude) if place.latitude is not None else None
+                    db_lon = float(place.longitude) if place.longitude is not None else None
+                    place_data["distance"] = haversine(float(latitude), float(longitude), db_lat, db_lon)
+
+                    # Add to processed results
+                    processed_results.append(place_data)
+
+                except ObjectDoesNotExist:
+                    # Place not in DB, process from API and save
+                    place_data = api_result # Start with API result
+
+                    # Calculate distance using API coordinates
+                    api_lat = api_result.get("location", {}).get("latitude")
+                    api_lon = api_result.get("location", {}).get("longitude")
+                    place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
+
+                    # Save to DB for future requests - use a wrapper function with sync_to_async
+                    def save_place_to_db():
+                        try:
+                            # Create new Place instance
+                            new_place = Place(
+                                title=api_result.get("title"),
+                                description=api_result.get("description"),
+                                place_id=place_id,
+                                data_id=api_result.get("data_id"),
+                                reviews_link=api_result.get("reviews_link"),
+                                photos_link=api_result.get("photos_link"),
+                                latitude=api_lat,
+                                longitude=api_lon,
+                                type=api_result.get("type"),
+                                types=api_result.get("types", []),
+                                address=api_result.get("address"),
+                                extensions=api_result.get("extensions", {}),
+                                display_name=api_result.get("displayName", {}).get("text") or api_result.get("title"),
+                                formatted_address=api_result.get("formattedAddress"),
+                                rating=api_result.get("rating"),
+                                reviews=api_result.get("reviews") or api_result.get("userRatingCount"),
+                                hours=api_result.get("operating_hours", {}),
+                                place_images=api_result.get("imagePlaces", []), # Save image URLs
+                                reviews_list=api_result.get("reviews_list", []) # Save reviews list if present in api_result
+                            )
+                            new_place.save()
+                            return True
+                        except Exception as e:
+                            print(f"Error saving place to DB: {e}")
+                            return False
+
+                    # Run the save function in a synchronous context
+                    save_place_to_db()
+
+                    # Calculate distance for the newly saved place
+                    # Use the coordinates directly from the api_result for distance calculation
+                    place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
+
+                    # Add to processed results
+                    processed_results.append(place_data)
+
+            except Exception as e:
+                print(f"Error processing place {place_id}: {e}")
+                # Still add API result to processed results
+                place_data = api_result
+                # Calculate distance
+                api_lat = api_result.get("location", {}).get("latitude")
+                api_lon = api_result.get("location", {}).get("longitude")
+                place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
+                processed_results.append(place_data)
+
+        # Sort by distance if calculated
+        processed_results.sort(key=lambda x: x.get("distance", float("inf")))
+
+        total_results = len(processed_results) # Use count from processed list
+        paginated_results = processed_results # For now, returning all processed results
 
         execution_time = round((time.time() - start_time) * 1000, 2)
         return Response({
-            "results": paginated_results,
+            "results": paginated_results, # Use the processed & paginated list
             "page": page,
-            "total_results": total_filtered_results,
+            "total_results": total_results,
             "execution_time_ms": execution_time
         }, status=HTTP_200_OK)
 
     async def async_main(self, params, filters, min_price, max_price):
         async with aiohttp.ClientSession() as session:
-            all_results = await self.async_fetch_all_places(params, session)
-            
-            print(f"num results before filter {len(all_results)}")
-            all_results = [r for r in all_results if self.apply_filters(r, filters, min_price, max_price)]
-            print(f"num results after filter {len(all_results)}")
+            # 1. Fetch initial place data from API
+            print("Fetching initial place data from API...")
+            api_results = await self.async_fetch_all_places(params, session)
+            if not api_results:
+                return []
 
-            all_results = await self.fetch_place_images(all_results, max_images=1)
-            all_results = [p for p in all_results if p.get("imagePlaces", [])]
+            # 2. Extract place IDs for database lookup
+            place_ids = [p.get("place_id") for p in api_results if p.get("place_id")]
+            print(f"Found {len(place_ids)} place IDs from initial API fetch")
 
-            print(f"Getting or uploading images for {len(all_results)} places...")
+            # 3. Create lookup map for API results to use later
+            api_results_map = {p.get("place_id"): p for p in api_results if p.get("place_id")}
 
-            """
-            async def process_place(place):
-                print(f"Processing place ID {place['id']}...")
-                place_id = place["id"]
-                image_places = place.get("imagePlaces", [])[:3]  # Limit to first 3 photos
-
-                if not image_places:
-                    print(f"No images found for place ID {place_id}")
-                    return place
-
-                data = {'image_urls': image_places, 'place_id': place["id"]}
-
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(IMAGE_DOWNLOAD_URL, json=data, timeout=30) as response:
-                            if response.status == 200:
-                                response_data = await response.json()
-                                print(f"Image download successful for place ID {place['id']}")
-                                place["imagePlaces"] = response_data.get("gcs_image_urls", [])
-                            else:
-                                print(f"Image download failed for place ID {place['id']}: {response.status}")
-                                place["imagePlaces"] = []
-                except Exception as e:
-                    print(f"Error during image download for place ID {place['id']}: {e}")
-                    place["imagePlaces"] = []
-
-                return place
-            
-            start_time = time.time()
-            all_results = await asyncio.gather(*[process_place(place) for place in all_results])
-            end_time = time.time()
-            """
-
-            start_time = time.time()
-            with ThreadPoolExecutor(max_workers=20) as executor:
-                # Prepare processing tasks for all places
-                future_to_place = {}
-                for place in all_results:
-                    image_urls = place.get("imagePlaces", [])[:3]
-                    if image_urls:
-                        future = executor.submit(
-                            process_images_for_place, 
-                            place["id"], 
-                            image_urls
-                        )
-                        future_to_place[future] = place
-                
-                # Process completed tasks as they finish
-                for future in as_completed(future_to_place):
-                    place = future_to_place[future]
-                    try:
-                        processed_urls = future.result()
-                        place["imagePlaces"] = processed_urls
-                        print(f"Processed {len(processed_urls)} images for place {place['id']}")
-                    except Exception as e:
-                        print(f"Error processing place {place['id']}: {e}")
-                        place["imagePlaces"] = []
-
-            end_time = time.time()
-            execution_time = round((end_time - start_time) * 1000, 2)
-            print(f"Finished processing images for {len(all_results)} places. Execution time: {execution_time} ms")
-        
-        #print(f'all plcace results: {len(all_results)}')
-        return all_results
-
-    async def async_fetch_place_details(self, place_id, session):
-        """Fetch individual place details asynchronously."""
-        if not place_id:
-            print(f"Place ID not found")
-            return None
-
-        url = f"{self.DETAILS_URL}{place_id}"
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": self.API_KEY,
-            "X-Goog-FieldMask": "*",  # Fetch all fields
-        }
-
-        async with session.get(url, headers=headers) as response:
-            details_data = await response.json()
-        
-        #photos = details_data.get("photos", [])[:3]  # Limit to first 5 photos
-        #image_places = []
-
-        def process_place(place):
-            print(f"Processing place ID {place['id']}...")
-            place_id = place["id"]
-            image_photos = place.get("photos", [])[:3]
-            image_urls = [f"https://places.googleapis.com/v1/{photo.get('name','')}/media?key={self.API_KEY}&maxHeightPx=600" for photo in image_photos if photo.get('name')]
-
-            place['images'] = process_images_for_place(place_id, image_urls, min_images=3)
-            return place
-            
-            """
-            if not image_photos:
-                print(f"No images found for place ID {place_id}")
-                return place
-
-            data = {'image_urls': image_photos, 'place_id': place["id"]}
+            # 4. Check database for existing places with these IDs
+            db_places = {}
+            places_needing_images = []
+            processed_results = []
 
             try:
-                response = requests.post(IMAGE_DOWNLOAD_URL, json=data)
-                if response.status_code == 200:
-                    print(f"Image download successful for place ID {place['id']}")
-                    place["images"] = response.json().get("gcs_image_urls", [])
-                else:
-                    print(f"Image download failed for place ID {place['id']}: {response.status_code}")
-                    place["images"] = []
+                # Query DB for existing places with these IDs - use sync_to_async
+                existing_places = await sync_to_async(list)(Place.objects.filter(place_id__in=place_ids))
+                print(f"Found {len(existing_places)} places in database")
+
+                for place in existing_places:
+                    # Convert DB model to dict format expected by frontend
+                    place_dict = {
+                        "place_id": place.place_id,
+                        "title": place.title,
+                        "description": place.description,
+                        "data_id": place.data_id,
+                        "reviews_link": place.reviews_link,
+                        "photos_link": place.photos_link,
+                        "location": {
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None
+                        },
+                        "gps_coordinates": {
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None
+                        },
+                        "type": place.type,
+                        "types": place.types,
+                        "address": place.address,
+                        "extensions": place.extensions,
+                        "displayName": {"text": place.display_name} if place.display_name else None,
+                        "formattedAddress": place.formatted_address,
+                        "rating": place.rating,
+                        "reviews": place.reviews,
+                        "operating_hours": place.hours,
+                        "imagePlaces": place.place_images or [],
+                        "reviews_list": place.reviews_list or [],
+                        "popular_times": place.popular_times,
+                        "category": place.category,  # Include category in response
+                        "source": "database"
+                    }
+
+                    # Store in our dictionary
+                    db_places[place.place_id] = place_dict
+
+                    # Check if this place has enough images
+                    min_images = 1  # Minimum number of images required
+                    if not place.place_images or len(place.place_images) < min_images:
+                        # If from database but needs images, add to processing list
+                        places_needing_images.append(place_dict)
+                    else:
+                        # Has enough images, add directly to final results
+                        processed_results.append(place_dict)
+                        print(f"Using cached place with images: {place.place_id}")
+
             except Exception as e:
-                print(f"Error during image download for place ID {place['id']}: {e}")
-                place["images"] = []
+                print(f"Error querying database for places: {e}")
+                # Continue execution even if DB query fails
 
-            return place
-            """
+            # 5. Identify places not in database - need full processing
+            missing_place_ids = [pid for pid in place_ids if pid not in db_places]
+            print(f"{len(missing_place_ids)} places not found in database")
 
-        return process_place(details_data)
+            # 6. Add API results for places not in database to the processing list
+            for place_id in missing_place_ids:
+                if place_id in api_results_map:
+                    api_result = api_results_map[place_id]
+                    api_result["source"] = "api"
+                    places_needing_images.append(api_result)
 
-        """
-        for photo in photos:
-            name = photo.get("name")
-            if name:
-                image_url = f"https://places.googleapis.com/v1/{name}/media?key={self.API_KEY}&maxHeightPx=600"
-                #proxied_image_url = f"/api/serve-image?url={google_image_url}"  # Proxy through your backend
-                image_places.append(image_url)
-        details_data["images"] = image_places  # Attach new key
-        """
+            # 7. Process images only for places that need them
+            print(f"Processing images for {len(places_needing_images)} places...")
+            if places_needing_images:
+                start_time = time.time()
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    # Map place to future for easy lookup after completion
+                    future_to_place = {
+                        executor.submit(process_images_for_place, place): place
+                        for place in places_needing_images
+                    }
+
+                    # Process completed tasks as they finish
+                    for future in as_completed(future_to_place):
+                        place = future_to_place[future]
+                        place_id = place.get('place_id')
+
+                        try:
+                            # Get processed image URLs
+                            processed_urls = future.result()
+
+                            # Update the place dict with new images
+                            if processed_urls:
+                                place["imagePlaces"] = processed_urls
+                                print(f"Processed {len(processed_urls)} images for place {place_id}")
+
+                                # Add to our results
+                                processed_results.append(place)
+
+                                # If it came from API (not DB), save to database
+                                if place.get("source") == "api":
+                                    try:
+                                        # Get coordinates
+                                        lat_val = place.get("location", {}).get("latitude")
+                                        lon_val = place.get("location", {}).get("longitude")
+
+                                        # Create a function to save to DB that we can call with sync_to_async
+                                        async def save_to_db():
+                                            # Create new Place instance
+                                            new_place = Place(
+                                                title=place.get("title"),
+                                                description=place.get("description"),
+                                                place_id=place_id,
+                                                data_id=place.get("data_id"),
+                                                reviews_link=place.get("reviews_link"),
+                                                photos_link=place.get("photos_link"),
+                                                latitude=lat_val,
+                                                longitude=lon_val,
+                                                type=place.get("type"),
+                                                types=place.get("types", []),
+                                                address=place.get("address"),
+                                                extensions=place.get("extensions", {}),
+                                                display_name=place.get("displayName", {}).get("text") or place.get("title"),
+                                                formatted_address=place.get("formattedAddress"),
+                                                rating=place.get("rating"),
+                                                reviews=place.get("reviews") or place.get("userRatingCount"),
+                                                hours=place.get("operating_hours", {}),
+                                                place_images=processed_urls,  # Store processed images
+                                                reviews_list=place.get("reviews_list", []),
+                                                popular_times=place.get("popular_times", []),
+                                                category=place.get("category", "")
+                                            )
+                                            await sync_to_async(new_place.save)()
+                                            return True
+
+                                        # Call the async function to save to DB
+                                        await save_to_db()
+                                        print(f"Saved new place to database: {place_id}")
+                                    except Exception as e:
+                                        print(f"Error saving place {place_id} to database: {e}")
+
+                                # If it came from DB, update the images
+                                elif place.get("source") == "database":
+                                    try:
+                                        # Function to update DB that we can call with sync_to_async
+                                        async def update_db_images():
+                                            db_place = await sync_to_async(Place.objects.get)(place_id=place_id)
+                                            db_place.place_images = processed_urls
+                                            await sync_to_async(db_place.save)(update_fields=['place_images'])
+                                            return True
+
+                                        # Call the async function to update DB
+                                        await update_db_images()
+                                        print(f"Updated images for existing place in database: {place_id}")
+                                    except Exception as e:
+                                        print(f"Error updating images for place {place_id}: {e}")
+                            else:
+                                # No images processed, but still add if from API
+                                if place.get("source") == "api":
+                                    processed_results.append(place)
+                                print(f"No images processed for place {place_id}")
+
+                        except Exception as e:
+                            print(f"Error processing place {place_id}: {e}")
+                            # Still add API result to results
+                            if place.get("source") == "api":
+                                place["imagePlaces"] = []
+                                processed_results.append(place)
+
+                end_time = time.time()
+                execution_time = round((end_time - start_time) * 1000, 2)
+                print(f"Finished processing images. Execution time: {execution_time} ms")
+
+            # 8. Filter results to places with images
+            final_results = [p for p in processed_results if p.get("imagePlaces", [])]
+            print(f"Returning {len(final_results)} places with images")
+
+            return final_results
+
+    async def async_fetch_place_details(self, place_id, session):
+        """Fetch individual place details asynchronously. Checks DB first."""
+        if not place_id:
+            print(f"Error: Place ID is required for fetch_place_details")
+            return None
+
+        min_images = 5  # Define minimum required images
+        db_place = None
+
+        place_data = {}
+
+        async def save_or_update_db(data, existing_db_place):
+            try:
+                lat_val = data.get("gps_coordinates", {}).get("latitude")  # Prefer gps_coordinates if available
+                lon_val = data.get("gps_coordinates", {}).get("longitude")
+                if lat_val is None or lon_val is None:  # Fallback to location if gps_coordinates missing
+                    lat_val = data.get("location", {}).get("latitude")
+                    lon_val = data.get("location", {}).get("longitude")
+
+                save_func = sync_to_async(lambda p: p.save())
+                update_fields = []
+
+                if existing_db_place:
+                    # Update existing record
+                    print(f"Updating existing database record for {place_id}")
+                    place_to_save = existing_db_place
+                    # Update fields selectively if they are better/more complete from API
+                    if data.get("title") and not place_to_save.title: place_to_save.title = data.get("title"); update_fields.append('title')
+                    if data.get("description") and not place_to_save.description: place_to_save.description = data.get("description"); update_fields.append('description')
+                    if data.get("address") and not place_to_save.address: place_to_save.address = data.get("address"); update_fields.append('address')
+                    if data.get("rating") and (place_to_save.rating is None or data.get("rating") > place_to_save.rating): place_to_save.rating = data.get("rating"); update_fields.append('rating')  # Example: update rating if API's is higher
+                    # Add category field if it exists in data
+                    if data.get("category") and not place_to_save.category: place_to_save.category = data.get("category"); update_fields.append('category')
+                    # Add more fields as needed
+                    place_to_save.place_images = data.get("place_images", [])
+                    update_fields.append('place_images')
+
+                    # Update popular_times if present in API data and missing in DB
+                    if data.get("popular_times") and not place_to_save.popular_times:
+                        place_to_save.popular_times = data.get("popular_times")
+                        update_fields.append('popular_times')
+
+                    await save_func(place_to_save)
+                    # Optionally use update_fields with save: await sync_to_async(place_to_save.save)(update_fields=update_fields)
+                else:
+                    # Create new record
+                    print(f"Creating new database record for {place_id}")
+                    place_to_save = Place(
+                        title=data.get("title"),
+                        description=data.get("description", ""),
+                        place_id=place_id,
+                        data_id=data.get("data_id"),
+                        reviews_link=data.get("reviews_link"),
+                        photos_link=data.get("photos_link"),
+                        latitude=lat_val,
+                        longitude=lon_val,
+                        type=data.get("type"),
+                        types=data.get("types", []),
+                        hours=data.get("hours", data.get("operating_hours", {})),
+                        address=data.get("address"),
+                        extensions=data.get("extensions", {}),
+                        display_name=(data.get("displayName", {}).get("text") or data.get("title")),
+                        formatted_address=data.get("formattedAddress"),
+                        rating=data.get("rating"),
+                        reviews=data.get("reviews") or data.get("userRatingCount"),
+                        place_images=data.get("place_images", []),
+                        reviews_list=data.get("reviews_list", []),
+                        popular_times=data.get("popular_times", []),
+                        category=data.get("category", "")
+                    )
+                    await save_func(place_to_save)
+                    print(f"Saved new place details to database: {place_id}")
+
+            except Exception as e:
+                print(f"Error saving/updating place details {place_id} to database: {e}")
+
+        # 1. Check Database First
+        try:
+            get_place_from_db = sync_to_async(Place.objects.get)
+            db_place = await get_place_from_db(place_id=place_id)
+            print(f"Found place details in database for ID: {place_id}")
+
+            place_data = {
+                "place_id": db_place.place_id,
+                "title": db_place.title,
+                "description": db_place.description,
+                "data_id": db_place.data_id,
+                "reviews_link": db_place.reviews_link,
+                "photos_link": db_place.photos_link,
+                "location": {
+                    "latitude": float(db_place.latitude) if db_place.latitude is not None else None,
+                    "longitude": float(db_place.longitude) if db_place.longitude is not None else None
+                },
+                "gps_coordinates": {
+                    "latitude": float(db_place.latitude) if db_place.latitude is not None else None,
+                    "longitude": float(db_place.longitude) if db_place.longitude is not None else None
+                },
+                "hours": db_place.hours,
+                "type": db_place.type,
+                "types": db_place.types,
+                "address": db_place.address,
+                "extensions": db_place.extensions,
+                "displayName": {"text": db_place.display_name} if db_place.display_name else None,
+                "formattedAddress": db_place.formatted_address,
+                "rating": db_place.rating,
+                "reviews": db_place.reviews,
+                "operating_hours": db_place.hours,
+                "place_images": db_place.place_images or [],  # Return existing images
+                "reviews_list": db_place.reviews_list or [],
+                "popular_times": db_place.popular_times,
+                "category": db_place.category,  # Include category in response
+                "source": "database"
+            }
+
+            # Check if images meet requirements
+            if db_place.place_images and len(db_place.place_images) >= min_images and db_place.reviews_list and db_place.popular_times and db_place.description:
+                print(f"Database entry for {place_id} has sufficient images. Returning cached data.")
+                # Convert DB model to dict format expected by frontend
+                return place_data
+            else:
+                print(f"Database entry for {place_id} found but needs images.")
+                import concurrent.futures
+                # Initialize place_data with default values
+                place_data['place_images'] = place_data.get('place_images', [])
+                place_data['reviews_list'] = place_data.get('reviews_list', [])
+                place_data['popular_times'] = place_data.get('popular_times', [])
+
+                # Define functions to run conditionally based on what we need
+                def fetch_images():
+                    if not db_place.place_images or not len(db_place.place_images) >= min_images:
+                        print(f"Fetching images for {place_id}")
+                        return process_images_for_place(place_data, min_images=min_images)
+                    return place_data.get('place_images', [])
+
+                def fetch_reviews():
+                    if not db_place.reviews_list:
+                        print(f"Fetching reviews for {place_id}")
+                        return get_reviews_from_serp(place_data.get('place_id'))
+                    return place_data.get('reviews_list', [])
+
+                def fetch_api_data():
+                    # Only fetch from API if we need description or popular_times
+                    if not place_data.get('description') or not place_data.get('popular_times'):
+                        print(f"Fetching additional details from SerpAPI for place ID: {place_id}")
+                        params = {
+                            "engine": "google_maps",
+                            "api_key": SERP_API_KEY,
+                            "place_id": place_id,
+                        }
+                        try:
+                            results = serpapi.search(params).get('place_results', {})
+                            return {
+                                'description': results.get('description'),
+                                'popular_times': results.get('popular_times')
+                            }
+                        except Exception as e:
+                            print(f"Error in API fetch: {e}")
+                            return {}
+                    return {}
+
+                # Execute the tasks in parallel
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    # Submit tasks that need to be executed
+                    futures = []
+
+                    # Only submit tasks if their conditions are met
+                    futures.append(executor.submit(fetch_images))
+                    futures.append(executor.submit(fetch_reviews))
+                    futures.append(executor.submit(fetch_api_data))
+
+                    # Process results as they complete
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            result = future.result()
+                            if isinstance(result, list) and result and isinstance(result[0], str) and '://storage.googleapis.com/' in result[0]:
+                                # This is likely the images result
+                                place_data['place_images'] = result
+                            elif isinstance(result, list) and result and isinstance(result[0], dict) and 'rating' in result[0]:
+                                # This is likely the reviews result
+                                place_data['reviews_list'] = result
+                            elif isinstance(result, dict):
+
+                                # This is likely the API result
+                                if result.get('description'):
+                                    place_data['description'] = result.get('description')
+                                else:
+                                    place_data['description'] = 'No description available'
+
+                                if result.get('popular_times'):
+                                    place_data['popular_times'] = result.get('popular_times')
+                        except Exception as e:
+                            print(f"Error processing parallel task result: {e}")
+
+                #if place_data.get('description') and place_data.get('popular_times'):
+
+                asyncio.create_task(save_or_update_db(place_data, db_place))
+                return place_data
+
+        except ObjectDoesNotExist:
+            print(f"Place details not found in database for ID: {place_id}. Fetching from API.")
+        except Exception as e:
+            print(f"Error checking database for place details {place_id}: {e}. Proceeding to API call.")
+
+        # 2. Fetch from SerpAPI if not in DB or needs images
+        print(f"Fetching details from SerpAPI for place ID: {place_id}")
+        params = {
+            "engine": "google_maps",
+            "api_key": SERP_API_KEY,
+            "place_id": place_id,
+        }
+
+        try:
+            # Note: serpapi.search is synchronous, consider running in executor if it blocks the event loop
+            # For now, assuming it's acceptable or handled within the library
+            api_results = serpapi.search(params).get('place_results', {})
+            if not api_results:
+                print(f"No results found from SerpAPI for place ID: {place_id}")
+                #return None
+
+            print(f"Successfully fetched details from SerpAPI for place ID {place_id}")
+
+            # 4. Save/Update Database Asynchronously
+            # If we have place_data from DB, update it with API results
+            if place_data:
+                # Update description if missing
+                if not place_data.get('description') and api_results.get('description'):
+                    place_data['description'] = api_results.get('description')
+
+                # Update popular_times if missing
+                if not place_data.get('popular_times') and api_results.get('popular_times'):
+                    place_data['popular_times'] = api_results.get('popular_times')
+
+                # Keep existing images and reviews in API results for database update
+                api_results["place_images"] = place_data.get("place_images", [])
+                api_results['reviews_list'] = place_data.get('reviews_list', [])
+
+                # Save/update DB with combined data in background
+                asyncio.create_task(save_or_update_db(place_data, db_place))
+
+                # Return the updated place_data
+                place_data['source'] = "database_updated"
+                return place_data
+            else:
+                # If no existing place_data, use API results directly
+                api_results["source"] = "api"
+
+                # Start the save/update operation in the background
+                asyncio.create_task(save_or_update_db(api_results, db_place))
+
+                return api_results
+
+        except Exception as e:
+            print(f"Error during SerpAPI fetch or processing for {place_id}: {e}")
+            # Decide what to return on API error. Maybe DB data if available but lacks images?
+            if db_place: # If we had DB data but API failed
+                 print(f"API failed for {place_id}, returning stale DB data.")
+                 # Convert DB model to dict and return (images might be missing/incomplete)
+                 place_data = { # Duplicating conversion logic, consider a helper function
+                     "place_id": db_place.place_id,
+                     "title": db_place.title,
+                     "description": db_place.description, # etc. ... fill all fields
+                     "place_images": db_place.place_images or [],
+                     "reviews_list": db_place.reviews_list or [],
+                     "popular_times": db_place.popular_times,
+                     "category": db_place.category,  # Include category in response
+                     "source": "database_stale"
+                 }
+                 return place_data
+            return None # Return None if no data source succeeded
 
     def get(self, request, place_id=None, is_authenticated=False):
         """Endpoint to fetch place details by ID."""
@@ -614,28 +1104,187 @@ class PlacesAPIView(APIView):
         # Rate limiting for unauthenticated users
         if not is_authenticated:
             rate_limit_response = self.check_rate_limit(
-                request, 
-                MAX_UNAUTHENTICATED_REQUESTS_PER_IP, 
+                request,
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP,
                 CACHE_TIMEOUT_SECONDS
             )
             if rate_limit_response:
                 return rate_limit_response
-            
+
         async def fetch_details():
+            # We don't need a full session here if async_fetch_place_details doesn't use it anymore
+            # However, keeping session creation for consistency if other methods need it
             async with aiohttp.ClientSession() as session:
                 return await self.async_fetch_place_details(place_id, session)
 
         place_details = asyncio.run(fetch_details())
-        
-        print('Number of reviews for place', len(place_details.get('reviews', [])))
-        #print('place details', place_details)
 
         if not place_details:
             return Response({"error": "Place not found"}, status=HTTP_404_NOT_FOUND)
 
+        print(f"Returning place details for {place_id} from GET endpoint. Source: {place_details.get('source', 'unknown')}")
+
         return Response(place_details, status=HTTP_200_OK)
 
-    async def async_fetch_all_places(self, params, session):
+    async def async_fetch_all_places(self, params, session, max_results=60):
+        """Fetches all places asynchronously using the new Places API v2."""
+        print(f"SERPAPI API Key: {SERP_API_KEY}")
+
+        radius = params["radius"]
+        location = params["location"]
+
+        # Convert radius to zoom level
+        # Significantly adjusted conversion formula for tighter results
+        if radius <= 100:
+            zoom_level = 21  # Extremely detailed view
+        elif radius <= 250:
+            zoom_level = 21
+        elif radius <= 500:
+            zoom_level = 21
+        elif radius <= 1000:
+            zoom_level = 21
+        elif radius <= 2000:
+            zoom_level = 21
+        elif radius <= 5000:
+            zoom_level = 21
+        elif radius <= 8000:  # ~5 miles
+            zoom_level = 21
+        elif radius <= 16000:  # ~10 miles
+            zoom_level = 20
+        else:
+            zoom_level = 19
+
+        print(f"Zoom level: {zoom_level}, Radius: {radius}, Location: {location}")
+
+        #query = ' OR '.join(params["types"]) if len(params["types"]) > 1 else params["types"]
+        
+        # Base parameters for the search
+        base_params = {
+            "api_key": SERP_API_KEY,
+            "engine": "google_maps",
+            "type": "search",
+            "google_domain": "google.com",
+            #"q": query,
+            "ll": f"@{location},{zoom_level}z",
+            "hl": "en"
+        }
+        
+        # Create params with different start values for pagination
+        async def fetch_page(query, category, start_value=0):
+            page_params = base_params.copy()
+            if start_value > 0:
+                page_params["start"] = str(start_value)
+            page_params["q"] = query
+            
+            try:
+                results = serpapi.search(page_params).get('local_results', [])
+                for result in results:
+                    result['category'] = category
+                return results
+            except Exception as e:
+                print(f"Error fetching results with params {page_params}: {e}")
+                return []
+        
+        # Fetch multiple pages concurrently
+        #start_values = [0, 20, 40]  # First, second, and third pages
+
+        types = params["types"]
+        #query_to_type = {}
+        #for category, query in types.items():
+            #query_to_type[query] = category
+
+        query_to_category = {}
+        if len(types.keys()) == 1:
+            type_list = list(types.values())[0]
+            type_group_size = len(type_list) // 3
+            types_groups = [type_list[i:i+type_group_size] for i in range(0, len(type_list), type_group_size)]
+            queries = [f"{' OR '.join(group)}" for group in types_groups]
+            for query in queries:
+                query_to_category[query] = list(types.keys())[0]
+        else:
+            queries = []
+            max_queries_per_type = 10
+            for category, curr_types in types.items():
+                new_query = f"{' OR '.join(curr_types[:max_queries_per_type])}"
+                query_to_category[new_query] = category
+                queries.append(new_query)
+
+        print(f"queries: {queries}")
+        page_tasks = [fetch_page(query, query_to_category[query]) for query in queries[:3]]
+        page_results = await asyncio.gather(*page_tasks)
+        
+        # Combine results from all pages
+        all_results = []
+        for page_result in page_results:
+            all_results.extend(page_result)
+        
+        # Remove duplicates based on place_id
+        unique_results = []
+        seen_ids = set()
+        for result in all_results:
+            place_id = result.get('place_id')
+            if place_id and place_id not in seen_ids:
+                unique_results.append(result)
+                seen_ids.add(place_id)
+        
+        print(f"Total unique results after pagination: {len(unique_results)}")
+
+        if TESTING:
+            unique_results = unique_results[:15]
+
+        def distance_between(lat1, lon1, lat2_lon2, lon2=None):
+            """Calculate distance between two coordinates using haversine formula"""
+            if lon2 is None:
+                # If lat2_lon2 is a string like "lat,lon"
+                if isinstance(lat2_lon2, str) and ',' in lat2_lon2:
+                    lat2, lon2 = map(float, lat2_lon2.split(','))
+                else:
+                    return 0  # Invalid input
+            else:
+                lat2 = lat2_lon2  # If all parameters provided individually
+
+            # Haversine formula
+            R = 3958.8  # Radius of the Earth in miles
+            lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            distance = R * c
+            return round(distance, 2)
+
+        # List to store filtered results
+        filtered_results = []
+
+        # Format results to match prev structure for now
+        for result in unique_results:
+            try:
+                result['location'] = result['gps_coordinates']
+
+                # Check if result is within radius
+                lat, lon = result['gps_coordinates']['latitude'], result['gps_coordinates']['longitude']
+                distance_miles = distance_between(lat, lon, location)
+                result['distance'] = distance_miles  # Add distance to result for reference
+                
+                # Convert radius from meters to miles for comparison
+                radius_miles = radius / 1609.34  # 1609.34 meters in a mile
+                
+                if distance_miles > radius_miles:
+                    print(f"Filtering out result {result.get('title')} - distance {distance_miles} miles exceeds radius {radius_miles} miles")
+                    continue
+                    
+                result['displayName'] = {
+                    'text': result['title'],
+                }
+                result['formattedAddress'] = result['address']
+                result['userRatingCount'] = result['reviews']
+                filtered_results.append(result)
+            except Exception as e:
+                print(f"Error processing result {result}: {e}")
+                
+        return filtered_results[:max_results]
+
+    async def async_fetch_all_places_prev(self, params, session):
         """Fetches all pages asynchronously using the new Places API v1."""
         headers = {
             "Content-Type": "application/json",
@@ -669,7 +1318,7 @@ class PlacesAPIView(APIView):
                     }
                 },
                 "includedTypes": group_types,
-                "maxResultCount": 5 if TESTING else 17,
+                "maxResultCount": 2 if TESTING else 17,
             }
 
             print(f"max result count is {5 if TESTING else 17}")
@@ -703,6 +1352,7 @@ class PlacesAPIView(APIView):
         # Combine results from all groups
         all_results = [item for sublist in results for item in sublist]
 
+        print('Example result:', all_results[0] if all_results else "No results found")
         print(f"results 0: {len(results[0])}")
         print(f"results 1: {len(results[1])}")
         print(f"results 2: {len(results[2])}")
@@ -752,23 +1402,6 @@ class PlacesAPIView(APIView):
             except Exception as e:
                 print(f"Error during image download for place ID {place['id']}: {e}")
                 place["imagePlaces"] = []
-
-            """
-            local_image_paths = []
-            for image_place in image_places:
-                # Download the image and save locally
-                local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
-                await self.download_image(image_place, local_file_path)
-                local_image_paths.append(local_file_path)
-
-            gcs_place_image_links = upload_place_images_to_bucket(
-                bucket_name='nurtr-places',
-                place_id=place["id"],
-                image_paths=local_image_paths
-            )
-
-            place["imagePlacesGCS"] = gcs_place_image_links
-            """
 
         return filtered_places
 
