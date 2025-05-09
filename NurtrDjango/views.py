@@ -39,6 +39,7 @@ import serpapi
 from .models import Place # Import the Place model
 from django.core.exceptions import ObjectDoesNotExist
 from asgiref.sync import sync_to_async
+import concurrent.futures
 
 load_dotenv()
 
@@ -654,6 +655,7 @@ class PlacesAPIView(APIView):
                 existing_places = await sync_to_async(list)(Place.objects.filter(place_id__in=place_ids))
                 print(f"Found {len(existing_places)} places in database")
 
+                start_time = time.time()
                 for place in existing_places:
                     # Convert DB model to dict format expected by frontend
                     place_dict = {
@@ -703,6 +705,9 @@ class PlacesAPIView(APIView):
             except Exception as e:
                 print(f"Error querying database for places: {e}")
                 # Continue execution even if DB query fails
+
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            print(f"Total time for querying database: {execution_time} ms")
 
             # 5. Identify places not in database - need full processing
             missing_place_ids = [pid for pid in place_ids if pid not in db_places]
@@ -1157,7 +1162,7 @@ class PlacesAPIView(APIView):
         print(f"Zoom level: {zoom_level}, Radius: {radius}, Location: {location}")
 
         #query = ' OR '.join(params["types"]) if len(params["types"]) > 1 else params["types"]
-        
+
         # Base parameters for the search
         base_params = {
             "api_key": SERP_API_KEY,
@@ -1168,64 +1173,105 @@ class PlacesAPIView(APIView):
             "ll": f"@{location},{zoom_level}z",
             "hl": "en"
         }
-        
-        # Create params with different start values for pagination
-        async def fetch_page(query, category, start_value=0):
-            page_params = base_params.copy()
-            if start_value > 0:
-                page_params["start"] = str(start_value)
-            page_params["q"] = query
-            
+
+        # Synchronous function to fetch a page of results
+        def fetch_page_sync(query_str, category_val, start_val=0):
+            page_params_sync = base_params.copy()
+            if start_val > 0:
+                page_params_sync["start"] = str(start_val)
+            page_params_sync["q"] = query_str
+
             try:
-                results = serpapi.search(page_params).get('local_results', [])
-                for result in results:
-                    result['category'] = category
-                return results
-            except Exception as e:
-                print(f"Error fetching results with params {page_params}: {e}")
+                # Direct blocking call to serpapi
+                search_result_sync = serpapi.search(page_params_sync)
+                results_sync = search_result_sync.get('local_results', [])
+                for res_item in results_sync:
+                    res_item['category'] = category_val
+                return results_sync
+            except Exception as e_sync:
+                print(f"Error fetching results with params {page_params_sync}: {e_sync}")
                 return []
-        
-        # Fetch multiple pages concurrently
-        #start_values = [0, 20, 40]  # First, second, and third pages
+
+        # The fetch_page_2 function you added is not used in this refactoring,
+        # but it's kept here if you were experimenting with it.
+        # import json # json import for fetch_page_2
+        # async def fetch_page_2(query, category, start_value=0):
+        #     url = "https://google.serper.dev/maps"
+        #     print(f"Query: {query}, Category: {category}, Start Value: {start_value}")
+        #     query = query[:10]
+
+        #     payload = json.dumps([ ... ]) # Your payload
+        #     headers = { ... } # Your headers
+        #     # Ensure 'requests' is imported if you use this: import requests
+        #     response = requests.request("POST", url, headers=headers, data=payload)
+        #     #print(response.text)
+        #     return [] # Placeholder return
 
         types = params["types"]
-        #query_to_type = {}
-        #for category, query in types.items():
-            #query_to_type[query] = category
-
         query_to_category = {}
         if len(types.keys()) == 1:
             type_list = list(types.values())[0]
-            type_group_size = len(type_list) // 3
+            # Ensure type_group_size is at least 1 to avoid issues with small lists
+            type_group_size = len(type_list) // 3 if len(type_list) // 3 > 0 else 1
             types_groups = [type_list[i:i+type_group_size] for i in range(0, len(type_list), type_group_size)]
-            queries = [f"{' OR '.join(group)}" for group in types_groups]
-            for query in queries:
-                query_to_category[query] = list(types.keys())[0]
+            queries = [f"{' OR '.join(group)}" for group in types_groups if group] # Ensure group is not empty
+            for query_item in queries:
+                query_to_category[query_item] = list(types.keys())[0]
         else:
             queries = []
-            max_queries_per_type = 10
-            for category, curr_types in types.items():
-                new_query = f"{' OR '.join(curr_types[:max_queries_per_type])}"
-                query_to_category[new_query] = category
-                queries.append(new_query)
+            max_queries_per_type = 10 #This can be adjusted
+            for category_item, curr_types in types.items():
+                # Ensure curr_types is not empty before join
+                if curr_types:
+                    new_query = f"{' OR '.join(curr_types[:max_queries_per_type])}"
+                    query_to_category[new_query] = category_item
+                    queries.append(new_query)
 
         print(f"queries: {queries}")
-        page_tasks = [fetch_page(query, query_to_category[query]) for query in queries[:3]]
-        page_results = await asyncio.gather(*page_tasks)
+
+        start_time = time.time()
+        all_api_results = []
+
+        if queries:  # Proceed only if there are queries
+            # Adjust max_workers based on API limits and number of queries
+            # Capping at 5 for this example, can be tuned.
+            num_workers = min(len(queries), 5)
+
+            # Direct use of ThreadPoolExecutor without asyncio
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all tasks to the executor
+                futures = {
+                    executor.submit(fetch_page_sync, q, query_to_category[q]): q 
+                    for q in queries
+                }
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(futures):
+                    query = futures[future]
+                    try:
+                        # Get the result of this specific future
+                        result_list = future.result()
+                        if result_list:  # Ensure it's not None or empty from an error
+                            all_api_results.extend(result_list)
+                            print(f"Received {len(result_list)} results for query: {query[:30]}...")
+                    except Exception as exc:
+                        print(f"Query {query[:30]}... generated an exception: {exc}")
         
-        # Combine results from all pages
-        all_results = []
-        for page_result in page_results:
-            all_results.extend(page_result)
+        end_time = time.time()
+        print(f"Time taken to fetch all pages: {end_time - start_time} seconds")
         
-        # Remove duplicates based on place_id
-        unique_results = []
-        seen_ids = set()
-        for result in all_results:
-            place_id = result.get('place_id')
-            if place_id and place_id not in seen_ids:
-                unique_results.append(result)
-                seen_ids.add(place_id)
+        # Combine results from all pages (all_api_results now holds all items)
+        # The original page_results variable might be overwritten or differently used below,
+        # this example focuses on collecting into all_api_results.
+        # Ensure downstream code uses all_api_results.
+        unique_results = {}
+        for result in all_api_results:
+            place_id = result.get("place_id")
+            if place_id and place_id not in unique_results:
+                unique_results[place_id] = result
+
+        # Remove duplicates based on place ID
+        unique_results = list(unique_results.values())
         
         print(f"Total unique results after pagination: {len(unique_results)}")
 
@@ -1276,8 +1322,8 @@ class PlacesAPIView(APIView):
                 result['displayName'] = {
                     'text': result['title'],
                 }
-                result['formattedAddress'] = result['address']
-                result['userRatingCount'] = result['reviews']
+                result['formattedAddress'] = result.get('address', 'no address found')
+                result['userRatingCount'] = result.get('reviews', 0)
                 filtered_results.append(result)
             except Exception as e:
                 print(f"Error processing result {result}: {e}")
