@@ -469,7 +469,7 @@ class PlacesAPIView(APIView):
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
             if not latitude or not longitude:
                 return Response({"error": "Invalid ZIP code or location not found"}, status=HTTP_400_BAD_REQUEST)
-
+        
         if not latitude or not longitude:
             return Response({"error": "Latitude and Longitude are required"}, status=HTTP_400_BAD_REQUEST)
 
@@ -478,7 +478,7 @@ class PlacesAPIView(APIView):
             "radius": radius,
             "key": self.API_KEY,
         }
-
+        
         if types:
             params["types"] = types
             print(f"num types {len(types.keys())}")
@@ -1107,6 +1107,7 @@ class PlacesAPIView(APIView):
         is_authenticated = request.query_params.get('is_authenticated', 'false').lower() == 'true'
 
         # Rate limiting for unauthenticated users
+        """
         if not is_authenticated:
             rate_limit_response = self.check_rate_limit(
                 request,
@@ -1115,6 +1116,7 @@ class PlacesAPIView(APIView):
             )
             if rate_limit_response:
                 return rate_limit_response
+        """
 
         async def fetch_details():
             # We don't need a full session here if async_fetch_place_details doesn't use it anymore
