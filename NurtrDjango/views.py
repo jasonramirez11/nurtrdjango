@@ -40,6 +40,7 @@ from .models import Place # Import the Place model
 from django.core.exceptions import ObjectDoesNotExist
 from asgiref.sync import sync_to_async
 import concurrent.futures
+import logging
 
 load_dotenv()
 
@@ -155,7 +156,7 @@ def upload_single_image_threaded(blob, local_path):
             return blob.public_url
         except Exception as e:
             print(f"Error uploading {local_path} to {blob.name}: {e}")
-            time.sleep(random.randint(2,3))
+            time.sleep(random.randint(1,5))
 
     return None # Indicate failure
 
@@ -221,43 +222,55 @@ def upload_place_images_to_bucket(
 
 def download_image(image_url):
     local_file_path = f"temp_images/{uuid.uuid4()}.jpg"
-    try:
-        response = requests.get(image_url, timeout=10)  # Set a timeout for the request
-        if response.status_code == 200:
-            with open(local_file_path, 'wb') as f:
-                f.write(response.content)
-            return local_file_path
-        else:
-            print(f"Failed to download {image_url}: Status {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Error downloading {image_url}: {str(e)}")
-        return None
+    for _ in range(3):
+        try:
+            response = requests.get(image_url, timeout=10)  # Set a timeout for the request
+            if response.status_code == 200:
+                with open(local_file_path, 'wb') as f:
+                    f.write(response.content)
+                return local_file_path
+            else:
+                raise Exception(f"Failed to download {image_url}: Status {response.status_code}")
+        except Exception as e:
+            print(f"Error downloading {image_url}: {str(e)}")
+            time.sleep(random.randint(1,5))
+    
+    return None
 
-def check_existing_images(bucket_name: str, place_id: str) -> List[str]:
+def check_existing_images(bucket_name: str, place_id: str, max_retries: int = 3) -> List[str]:
     """
-    Check if images for the given place_id exist in the specified GCS bucket.
-
-    Args:
-        bucket_name (str): The name of the GCS bucket.
-        place_id (str): The ID of the place to check.
-
-    Returns:
-        List[str]: A list of existing image URLs if found, otherwise an empty list.
+    Check if images for the given place_id exist in the specified GCS bucket with retry logic.
     """
     print(f"Checking for existing images in bucket '{bucket_name}' for Place ID '{place_id}'...")
     start_time = time.time()
-    storage_client = Client()
-    bucket = storage_client.bucket(bucket_name)
-    prefix = f"places/{place_id}/"  # Assuming images are stored under a folder named after the place_id
-
-    blobs = bucket.list_blobs(prefix=prefix)  # List blobs with the specified prefix
-    existing_images = [blob.public_url for blob in blobs]  # Adjust based on your image format
-
-    end_time = time.time()
-    print(f"Finished checking for existing images for Place ID '{place_id}'.")
-    print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
-    return existing_images
+    
+    for attempt in range(max_retries + 1):
+        try:
+            storage_client = Client()
+            bucket = storage_client.bucket(bucket_name)
+            prefix = f"places/{place_id}/"
+            
+            blobs = bucket.list_blobs(prefix=prefix)
+            existing_images = [blob.public_url for blob in blobs]
+            
+            end_time = time.time()
+            print(f"Finished checking for existing images for Place ID '{place_id}'.")
+            print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
+            return existing_images
+            
+        except Exception as e:
+            if attempt == max_retries:
+                # Last attempt failed, log and return empty list
+                logging.error(f"Failed to check existing images for place {place_id} after {max_retries} retries: {str(e)}")
+                print(f"Error checking images for Place ID '{place_id}' after {max_retries} retries: {str(e)}")
+                return []
+            else:
+                # Wait before retrying with exponential backoff
+                wait_time = (2 ** attempt) + 1  # 1, 3, 5 seconds
+                print(f"Attempt {attempt + 1} failed for Place ID '{place_id}', retrying in {wait_time}s...")
+                time.sleep(wait_time)
+    
+    return []
 
 
 def get_images_from_serp(place_image_link, max_images=1):
@@ -461,11 +474,14 @@ class PlacesAPIView(APIView):
         max_price = data.get("maxPrice", 500)
         filters = data.get("filters", [])
         page = int(data.get("page", 1))
-        #items_per_page = 4
 
-        #print('places request ', request)
+        if data.get('load_more', False):
+            page += 1
+        
+        print('page', page)
+        print('load more', data.get('load_more', False))
+        
         if zip_code:
-            #print(f"zip code: {zip_code} {type(zip_code)}")
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
             if not latitude or not longitude:
                 return Response({"error": "Invalid ZIP code or location not found"}, status=HTTP_400_BAD_REQUEST)
@@ -503,11 +519,15 @@ class PlacesAPIView(APIView):
             distance = R * c
             return round(distance, 2)
 
+        seen_place_ids = set()
+
         # Process each result from the API
         for api_result in api_results:
             place_id = api_result.get("place_id")
-            if not place_id:
+            if not place_id or place_id in seen_place_ids:
                 continue # Skip if no place_id
+
+            seen_place_ids.add(place_id)
 
             try:
                 # Check if place exists in DB - use a direct function call with sync_to_async
@@ -617,7 +637,7 @@ class PlacesAPIView(APIView):
                 processed_results.append(place_data)
 
         # Sort by distance if calculated
-        processed_results.sort(key=lambda x: x.get("distance", float("inf")))
+        #processed_results.sort(key=lambda x: x.get("distance", float("inf")))
 
         total_results = len(processed_results) # Use count from processed list
         paginated_results = processed_results # For now, returning all processed results
@@ -754,10 +774,8 @@ class PlacesAPIView(APIView):
                                         # Get coordinates
                                         lat_val = place.get("location", {}).get("latitude")
                                         lon_val = place.get("location", {}).get("longitude")
-
-                                        # Create a function to save to DB that we can call with sync_to_async
+                                        
                                         async def save_to_db():
-                                            # Create new Place instance
                                             new_place = Place(
                                                 title=place.get("title"),
                                                 description=place.get("description"),
@@ -784,7 +802,6 @@ class PlacesAPIView(APIView):
                                             await sync_to_async(new_place.save)()
                                             return True
 
-                                        # Call the async function to save to DB
                                         await save_to_db()
                                         print(f"Saved new place to database: {place_id}")
                                     except Exception as e:
@@ -793,14 +810,12 @@ class PlacesAPIView(APIView):
                                 # If it came from DB, update the images
                                 elif place.get("source") == "database":
                                     try:
-                                        # Function to update DB that we can call with sync_to_async
                                         async def update_db_images():
                                             db_place = await sync_to_async(Place.objects.get)(place_id=place_id)
                                             db_place.place_images = processed_urls
                                             await sync_to_async(db_place.save)(update_fields=['place_images'])
                                             return True
 
-                                        # Call the async function to update DB
                                         await update_db_images()
                                         print(f"Updated images for existing place in database: {place_id}")
                                     except Exception as e:
@@ -1104,19 +1119,6 @@ class PlacesAPIView(APIView):
             return Response({"error": "Place ID is required"}, status=HTTP_400_BAD_REQUEST)
 
         print('request query params', request.query_params)
-        is_authenticated = request.query_params.get('is_authenticated', 'false').lower() == 'true'
-
-        # Rate limiting for unauthenticated users
-        """
-        if not is_authenticated:
-            rate_limit_response = self.check_rate_limit(
-                request,
-                MAX_UNAUTHENTICATED_REQUESTS_PER_IP,
-                CACHE_TIMEOUT_SECONDS
-            )
-            if rate_limit_response:
-                return rate_limit_response
-        """
 
         async def fetch_details():
             # We don't need a full session here if async_fetch_place_details doesn't use it anymore
@@ -1163,24 +1165,24 @@ class PlacesAPIView(APIView):
 
         print(f"Zoom level: {zoom_level}, Radius: {radius}, Location: {location}")
 
-        #query = ' OR '.join(params["types"]) if len(params["types"]) > 1 else params["types"]
-
         # Base parameters for the search
         base_params = {
             "api_key": SERP_API_KEY,
             "engine": "google_maps",
             "type": "search",
             "google_domain": "google.com",
-            #"q": query,
             "ll": f"@{location},{zoom_level}z",
             "hl": "en"
         }
 
-        # Synchronous function to fetch a page of results
-        def fetch_page_sync(query_str, category_val, start_val=0):
+        start_val = 1 if params.get("load_more", False) else 0
+
+        def fetch_page_sync(query_str, category_val, start_val=start_val):
             page_params_sync = base_params.copy()
             if start_val > 0:
                 page_params_sync["start"] = str(start_val)
+
+            print(f"Fetching page with query: {query_str}")
             page_params_sync["q"] = query_str
 
             try:
@@ -1193,21 +1195,6 @@ class PlacesAPIView(APIView):
             except Exception as e_sync:
                 print(f"Error fetching results with params {page_params_sync}: {e_sync}")
                 return []
-
-        # The fetch_page_2 function you added is not used in this refactoring,
-        # but it's kept here if you were experimenting with it.
-        # import json # json import for fetch_page_2
-        # async def fetch_page_2(query, category, start_value=0):
-        #     url = "https://google.serper.dev/maps"
-        #     print(f"Query: {query}, Category: {category}, Start Value: {start_value}")
-        #     query = query[:10]
-
-        #     payload = json.dumps([ ... ]) # Your payload
-        #     headers = { ... } # Your headers
-        #     # Ensure 'requests' is imported if you use this: import requests
-        #     response = requests.request("POST", url, headers=headers, data=payload)
-        #     #print(response.text)
-        #     return [] # Placeholder return
 
         types = params["types"]
         query_to_category = {}
@@ -1229,19 +1216,15 @@ class PlacesAPIView(APIView):
                     query_to_category[new_query] = category_item
                     queries.append(new_query)
 
-        print(f"queries: {queries}")
+        print(f"{len(queries)} queries: {queries}")
 
         start_time = time.time()
         all_api_results = []
 
-        if queries:  # Proceed only if there are queries
-            # Adjust max_workers based on API limits and number of queries
-            # Capping at 5 for this example, can be tuned.
+        if queries:
             num_workers = min(len(queries), 5)
 
-            # Direct use of ThreadPoolExecutor without asyncio
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all tasks to the executor
                 futures = {
                     executor.submit(fetch_page_sync, q, query_to_category[q]): q 
                     for q in queries
