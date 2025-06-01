@@ -5,7 +5,7 @@ from .views import UserViewSet
 from users.views import UserCreateView ,ChildViewSet
 from django.conf.urls.static import static
 from NurtrDjango import settings
-from .views import PlacesAPIView, serve_image
+from .views import PlacesAPIView, serve_image, EventsAPIView
 from django.http import HttpResponse
 from django.urls import get_resolver
 from .views import ImageDownloadAPIView
@@ -34,6 +34,7 @@ urlpatterns = [
     path('api/', include(router.urls)),  
     path('api/places/', PlacesAPIView.as_view(), name='places_api'),
     path('api/places/place-details/<str:place_id>/', PlacesAPIView.as_view(), name='place_details'),
+    path('api/events/', EventsAPIView.as_view(), name='events_api'),
     path('api/image-download/', ImageDownloadAPIView.as_view(), name='image_download'),
     path('debug/urls/', show_urls),
     # Add a direct path to the authenticate endpoint as a fallback

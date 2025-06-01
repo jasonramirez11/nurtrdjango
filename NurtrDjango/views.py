@@ -41,6 +41,8 @@ from django.core.exceptions import ObjectDoesNotExist
 from asgiref.sync import sync_to_async
 import concurrent.futures
 import logging
+import json
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -431,7 +433,6 @@ class PlacesAPIView(APIView):
 
     async def get_coordinates_from_zip(self, zip_code):
         """Fetch latitude and longitude from ZIP code using Geocoding API."""
-        # Include USA in the address query
         url = f"{self.GEOCODE_URL}?address={zip_code}+USA&key={self.API_KEY}"
 
         async with aiohttp.ClientSession() as session:
@@ -1587,3 +1588,795 @@ def serve_image(request, image_url):
     """Proxy image from Google's server."""
     response = requests.get(image_url, stream=True)
     return HttpResponse(response.content, content_type=response.headers['Content-Type'])
+
+class EventsAPIView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+
+    def get_client_ip(self, request):
+        """Utility function to get client IP address."""
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+        return ip
+
+    async def get_coordinates_from_zip(self, zip_code):
+        """Fetch latitude and longitude from ZIP code using Geocoding API."""
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={zip_code}+USA&key=AIzaSyBfW8nU2EoPK1Zg_bYOSREzqmRDwZfUgbM"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                data = await response.json()
+
+        if data.get("results"):
+            location = data["results"][0]["geometry"]["location"]
+            return location["lat"], location["lng"]
+
+        return None, None
+
+    def get_city_from_coordinates(self, latitude, longitude):
+        """Get city name from coordinates using reverse geocoding."""
+        try:
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={latitude},{longitude}&key=AIzaSyBfW8nU2EoPK1Zg_bYOSREzqmRDwZfUgbM"
+            response = requests.get(url)
+            data = response.json()
+            
+            if data.get("results"):
+                for component in data["results"][0]["address_components"]:
+                    if "locality" in component["types"]:
+                        return component["long_name"]
+                    elif "administrative_area_level_1" in component["types"]:
+                        return component["long_name"]
+            return "Unknown Location"
+        except Exception as e:
+            print(f"Error getting city from coordinates: {e}")
+            return "Unknown Location"
+    
+    async def get_city_state_and_coordinates_from_zip(self, zip_code):
+        """Fetch city, state, and coordinates from ZIP code using Geocoding API."""
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={zip_code}+USA&key=AIzaSyBfW8nU2EoPK1Zg_bYOSREzqmRDwZfUgbM"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                data = await response.json()
+
+        if data.get("results") and len(data["results"]) > 0:
+            result = data["results"][0]
+            
+            # Extract coordinates from geometry
+            location = result.get("geometry", {}).get("location", {})
+            latitude = location.get("lat")
+            longitude = location.get("lng")
+            
+            # Extract city and state from address_components
+            city = None
+            state = None
+            
+            address_components = result.get("address_components", [])
+            for component in address_components:
+                types = component.get("types", [])
+                
+                # Get city from locality
+                if "locality" in types:
+                    city = component.get("long_name")
+                
+                # Get state abbreviation from administrative_area_level_1
+                elif "administrative_area_level_1" in types:
+                    state = component.get("long_name")
+            
+            return city, state, latitude, longitude
+
+        return None, None, None, None
+
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance between two coordinates using haversine formula."""
+        if None in [lat1, lon1, lat2, lon2]:
+            return None
+        
+        R = 3958.8  # Radius of the Earth in miles
+        lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        distance = R * c
+        return round(distance, 2)
+
+    def extract_coordinates_from_address(self, address_list):
+        """Extract coordinates from address using geocoding."""
+        if not address_list:
+            return None, None
+        
+        # Join address components
+        full_address = ", ".join(address_list)
+        
+        try:
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?address={full_address}&key=AIzaSyBfW8nU2EoPK1Zg_bYOSREzqmRDwZfUgbM"
+            response = requests.get(url)
+            data = response.json()
+            
+            if data.get("results"):
+                location = data["results"][0]["geometry"]["location"]
+                return location["lat"], location["lng"]
+        except Exception as e:
+            print(f"Error geocoding address {full_address}: {e}")
+        
+        return None, None
+
+    def post(self, request):
+        start_time = time.time()
+        
+        print('Events request:', request.data)
+        print('User is authenticated:', request.data.get('is_authenticated', False))
+
+        # Rate limiting for unauthenticated users
+        if False and not request.data.get('is_authenticated', False): # NOT ENABLED FOR NOW
+            rate_limit_response = self.check_rate_limit(
+                request,
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP,
+                CACHE_TIMEOUT_SECONDS
+            )
+            if rate_limit_response:
+                return rate_limit_response
+
+        data = request.data
+
+        print(f"request data: {data}")
+        zip_code = data.get("zip_code")
+        
+        city_and_state = data.get("city_and_state")
+        latitude = data.get("latitude", 40.712776)
+        longitude = data.get("longitude", -74.005974)
+
+        # Convert radius to float to ensure proper comparison
+        try:
+            radius = float(data.get("radius", 25))  # Default radius in miles
+        except (ValueError, TypeError):
+            radius = 25.0  # Fallback to default if conversion fails
+        
+        event_types = data.get("event_types", [])  # Array of event types to filter
+        print(f"event_types: {event_types}")
+        date_range = data.get("date_range", "this_month")  # this_week, this_month, next_month
+        
+        try:
+            page = int(data.get("page", 1))
+        except (ValueError, TypeError):
+            page = 1
+
+        # Get coordinates from zip code if provided
+        city_and_state = ""
+        if zip_code:
+            city, state, latitude, longitude = asyncio.run(self.get_city_state_and_coordinates_from_zip(zip_code))
+            if city and state:
+                city_and_state = f"{city}, {state}"
+        
+        # Run asynchronous search for events
+        events_results = asyncio.run(self.async_search_events(city_and_state, event_types, date_range, page))
+
+        # Process and filter events by distance
+        processed_events = []
+        for event in events_results:
+            # Extract coordinates from event address
+            event_lat, event_lon = self.extract_coordinates_from_address(event.get("address", []))
+            
+            if event_lat and event_lon:
+                # Calculate distance from search location
+                distance = self.calculate_distance(latitude, longitude, event_lat, event_lon)
+                
+                # Filter by radius (now both are guaranteed to be numbers)
+                if distance and distance <= radius:
+                    event["distance"] = distance
+                    event["event_latitude"] = event_lat
+                    event["event_longitude"] = event_lon
+                    processed_events.append(event)
+                    print(f"Event {event.get('title', 'Unknown')} is within the radius of {radius} miles")
+                else:
+                    print(f"Event {event.get('title', 'Unknown')} is outside the radius of {radius} miles")
+                    print(f"Distance: {distance}")
+                    print(f"Latitude: {event_lat}")
+                    print(f"Longitude: {event_lon}")
+                    print(f"Radius: {radius}")
+            else:
+                # If we can't get coordinates, include the event but mark distance as unknown
+                event["distance"] = None
+                event["event_latitude"] = None
+                event["event_longitude"] = None
+                processed_events.append(event)
+
+        # Sort by distance (events with unknown distance go to the end)
+        processed_events.sort(key=lambda x: x.get("distance") if x.get("distance") is not None else float('inf'))
+
+        # Limit results for pagination
+        results_per_page = 20
+        start_index = (page - 1) * results_per_page
+        end_index = start_index + results_per_page
+        paginated_events = processed_events[start_index:end_index]
+
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        
+        return Response({
+            "results": paginated_events,
+            "page": page,
+            "total_results": len(processed_events),
+            "execution_time_ms": execution_time,
+            "search_location": {
+                "city_and_state": city_and_state,
+                "latitude": latitude,
+                "longitude": longitude
+            }
+        }, status=HTTP_200_OK)
+
+    async def async_search_events_2(self, city_and_state, event_types, date_range, page):
+        """Search for events using SERP API with parallel execution."""
+        print(f"Searching for events in {city_and_state}")
+        
+        try:
+            # Build optimized search queries
+            search_queries = self.build_kid_friendly_search_queries(event_types, city_and_state)[:3]
+            
+            print(f"Executing {len(search_queries)} searches in parallel...")
+            
+            # Create a function to execute a single search query
+            def execute_single_search(query):
+                """Execute a single search query - runs in thread pool."""
+                try:
+                    print(f"Executing search query: {query}")
+                    
+                    params = {
+                        "engine": "google_events",
+                        "q": query,
+                        "api_key": SERP_API_KEY,
+                        "hl": "en",
+                        "gl": "us"
+                    }
+
+                    if city_and_state:
+                        params["location"] = f"{city_and_state}, United States"
+
+                    # Add date filtering
+                    if date_range and isinstance(date_range, list):
+                        date_filters = [f"date:{date_item}" for date_item in date_range]
+                        params["htichips"] = ",".join(date_filters)
+
+                    print(f"SERP API params for '{query}': {params}")
+
+                    start_time = time.time()
+                    search_results = serpapi.search(params)
+                    end_time = time.time()
+
+                    print(f"SERP API call for '{query}' took {end_time - start_time:.2f} seconds")
+
+                    # Extract events from results
+                    events = search_results.get('events_results', [])
+                    print(f"Found {len(events)} events for query: {query}")
+
+                    # Process events for this query
+                    processed_events = []
+                    for event in events:
+                        processed_event = self.process_event_data(event)
+                        if processed_event:
+                            processed_events.append(processed_event)
+
+                    return {
+                        'query': query,
+                        'events': processed_events,
+                        'success': True,
+                        'execution_time': end_time - start_time
+                    }
+                    
+                except Exception as e:
+                    print(f"Error with query '{query}': {e}")
+                    return {
+                        'query': query,
+                        'events': [],
+                        'success': False,
+                        'error': str(e)
+                    }
+
+            # Execute all searches in parallel
+            overall_start_time = time.time()
+            all_events = []
+            
+            # Use ThreadPoolExecutor to run searches concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(search_queries), 5)) as executor:
+                # Submit all search tasks
+                future_to_query = {
+                    executor.submit(execute_single_search, query): query 
+                    for query in search_queries
+                }
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_query):
+                    query = future_to_query[future]
+                    try:
+                        result = future.result()
+                        
+                        if result['success']:
+                            all_events.extend(result['events'])
+                            print(f"Successfully processed {len(result['events'])} events from query: '{query}' "
+                                  f"(took {result['execution_time']:.2f}s)")
+                        else:
+                            print(f"Failed to process query '{query}': {result.get('error', 'Unknown error')}")
+                            
+                    except Exception as exc:
+                        print(f"Query '{query}' generated an exception: {exc}")
+
+            overall_end_time = time.time()
+            total_execution_time = overall_end_time - overall_start_time
+            
+            print(f"Parallel execution completed in {total_execution_time:.2f} seconds")
+            print(f"Total events collected from all queries: {len(all_events)}")
+            
+            #if all_events:
+             #   print(f"Sample event: {all_events[0]}")
+            print(f"search_queries: {search_queries}")
+            
+            # Remove duplicates based on event ID
+            unique_events = []
+            seen_events = set()
+            
+            for event in all_events:
+                # Create a unique identifier based on event ID
+                event_key = event.get('id', '')
+                
+                if event_key and event_key not in seen_events:
+                    seen_events.add(event_key)
+                    unique_events.append(event)
+
+            print(f"Total unique events found: {len(unique_events)} (from {len(all_events)} total)")
+            
+            return unique_events
+
+        except Exception as e:
+            print(f"Error in parallel search execution: {e}")
+            traceback.print_exc()
+            return []
+
+    def process_event_data(self, event):
+        """Process and standardize event data from SERP API."""
+
+        # Create a more stable unique identifier
+        title = event.get('title', '').strip()
+        venue_name = event.get('venue', {}).get('name', '').strip()
+        start_date = event.get('date', {}).get('start_date', '').strip()
+        when_time = event.get('date', {}).get('when', '').strip()
+        
+        # Use address as fallback if venue name is missing or inconsistent
+        address_list = event.get('address', [])
+        venue_identifier = venue_name
+        if not venue_identifier and address_list:
+            # Use first address component as venue identifier
+            venue_identifier = address_list[0].strip()
+        
+        # Normalize the when field to remove timezone variations and extra whitespace
+        normalized_when = ' '.join(when_time.split()) if when_time else ''
+        # Remove timezone abbreviations for consistency (PDT, PST, EDT, EST, etc.)
+        normalized_when = normalized_when.replace(' PDT', '').replace(' PST', '').replace(' EDT', '').replace(' EST', '')
+        
+        # Create a more stable identifier using venue + date + normalized title
+        # This helps avoid duplicates from the same event at the same venue/time
+        id_components = [
+            title.lower().replace(' ', '_'),
+            venue_identifier.lower().replace(' ', '_'),
+            start_date.replace(' ', '_'),
+            normalized_when.lower().replace(' ', '_').replace(',', '')
+        ]
+        
+        # Filter out empty components and create a stable hash
+        stable_components = [comp for comp in id_components if comp]
+        stable_string = '_'.join(stable_components)
+        
+        # Use a more deterministic approach - you could also use a UUID based on content
+        import hashlib
+        event_id = f"event_{hashlib.md5(stable_string.encode()).hexdigest()[:16]}"
+        
+        try:
+            # Extract and standardize event information
+            processed_event = {
+                "id": event_id,
+                "title": event.get("title", ""),
+                "description": event.get("description", ""),
+                "date": event.get("date", {}),
+                "address": event.get("address", []),
+                "link": event.get("link", ""),
+                "venue": event.get("venue", {}),
+                "ticket_info": event.get("ticket_info", []),
+                "thumbnail": event.get("thumbnail", ""),
+                "image": event.get("image", ""),
+                "event_location_map": event.get("event_location_map", {}),
+                
+                # Additional processed fields
+                "formatted_address": ", ".join(event.get("address", [])),
+                "venue_name": event.get("venue", {}).get("name", ""),
+                "venue_rating": event.get("venue", {}).get("rating"),
+                "venue_reviews": event.get("venue", {}).get("reviews"),
+                
+                # Date processing
+                "start_date": event.get("date", {}).get("start_date", ""),
+                "when": event.get("date", {}).get("when", ""),
+                
+                # Ticket availability
+                "has_tickets": len(event.get("ticket_info", [])) > 0,
+                "ticket_sources": [ticket.get("source") for ticket in event.get("ticket_info", [])],
+                
+                # Event type classification (can be enhanced)
+                "event_type": self.classify_event_type(event.get("title", "") + " " + event.get("description", "")),
+                
+                # Source information
+                "source": "serp_api",
+                "last_updated": datetime.now().isoformat()
+            }
+
+            return processed_event
+
+        except Exception as e:
+            print(f"Error processing event data: {e}")
+            return None
+
+    def classify_event_type(self, text):
+        """Classify event type based on title and description."""
+        text_lower = text.lower()
+        
+        # Define event type keywords
+        event_types = {
+            "music": ["concert", "music", "band", "festival", "live music", "performance", "show"],
+            "sports": ["game", "match", "tournament", "sports", "football", "basketball", "baseball", "soccer"],
+            "family": ["family", "kids", "children", "playground", "zoo", "museum"],
+            "food": ["food", "restaurant", "dining", "taste", "culinary", "cooking"],
+            "arts": ["art", "gallery", "exhibition", "theater", "dance", "cultural"],
+            "education": ["workshop", "class", "seminar", "conference", "learning", "training"],
+            "outdoor": ["outdoor", "park", "hiking", "nature", "camping", "adventure"],
+            "entertainment": ["comedy", "movie", "film", "entertainment", "fun"]
+        }
+        
+        # Check which category the event belongs to
+        for event_type, keywords in event_types.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return event_type
+        
+        return "general"
+
+    def check_rate_limit(self, request, max_requests, cache_timeout=None):
+        """
+        Enforces rate limiting for unauthenticated requests.
+        Uses the same logic as PlacesAPIView.
+        """
+        ip_address = self.get_client_ip(request)
+
+        country_cache_key = f"ip_country_{ip_address}"
+        country = cache.get(country_cache_key)
+        if not country:
+            try:
+                url = f"https://ipinfo.io/json?token={IP_INFO_API_TOKEN}"
+                response = requests.get(url)
+                if response.status_code == 200:
+                    data = response.json()
+                    country = data.get("country", "Unknown")
+                    cache.set(country_cache_key, country, timeout=cache_timeout)
+                else:
+                    country = 'US'
+            except Exception as e:
+                print(f"Error checking IP country for {ip_address}: {e}")
+                country = 'US'
+
+        # Block requests not from the US
+        if country != 'US':
+            return Response(
+                {"error": "Access restricted to US-based users only."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        cache_key = f"events_api_requests_{ip_address}"
+        request_count = cache.get(cache_key, 0)
+
+        if request_count > max_requests:
+            return Response(
+                {"error": "Request limit reached for unauthenticated users. Please sign in to continue."},
+                status=HTTP_429_TOO_MANY_REQUESTS
+            )
+        
+        cache.set(cache_key, request_count + 1, timeout=cache_timeout)
+        print(f"Unauthenticated events request from IP {ip_address}. Count: {request_count + 1}")
+        return None
+
+
+    def build_kid_friendly_search_queries(self, event_types, city_and_state):
+        """
+        Build optimized search queries for kid-friendly events based on selected categories.
+        Uses broader, more general terms to get more results.
+        """
+        
+        # Define category-specific keywords - simplified and more general
+        category_keywords = {
+            "music_classes": [
+                "kids music",
+                "family music",
+                "children music classes"
+            ],
+            "art_classes": [
+                "kids art",
+                "family art", 
+                "children art classes"
+            ],
+            "outdoor": [
+                "kids outdoor",
+                "family outdoor activities",
+                "children nature"
+            ],
+            "indoor": [
+                "kids indoor",
+                "family fun center",
+                "children indoor activities"
+            ],
+            "seasonal_play": [
+                "kids seasonal",
+                "family holiday events",
+                "children activities"
+            ],
+            "museums": [
+                "kids museum",
+                "family museum",
+                "children museum"
+            ],
+            "aquariums": [
+                "kids aquarium",
+                "family aquarium", 
+                "children aquarium"
+            ],
+            "water_parks": [
+                "kids water park",
+                "family water activities",
+                "children swimming"
+            ]
+        }
+        
+        queries = []
+        
+        # If no specific categories are selected, create general kid-friendly queries
+        if not event_types:
+            base_queries = [
+                f"kids activities near {city_and_state}",
+                f"family events near {city_and_state}",
+                f"children activities near {city_and_state}"
+            ]
+            return base_queries
+        
+        # Convert event_types to lowercase and replace spaces with underscores for mapping
+        normalized_types = [t.lower().replace(" ", "_") for t in event_types]
+        
+        # For each category, create 3 search variations
+        for event_type in normalized_types:
+            if event_type in category_keywords:
+                # Use all 3 variations for each category
+                for keyword_phrase in category_keywords[event_type]:
+                    queries.append(f"{keyword_phrase} near {city_and_state}")
+        
+        # If we don't have enough queries, add some general fallbacks
+        if len(queries) < 3:
+            fallback_queries = [
+                f"family events near {city_and_state}",
+                f"kids activities near {city_and_state}",
+                f"children programs near {city_and_state}"
+            ]
+            
+            # Add fallbacks to reach at least 3 queries
+            for fallback in fallback_queries:
+                if fallback not in queries and len(queries) < 6:
+                    queries.append(fallback)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_queries = []
+        for query in queries:
+            if query not in seen:
+                seen.add(query)
+                unique_queries.append(query)
+        
+        # Limit to maximum 6 queries and randomize
+        final_queries = unique_queries[:6]
+        random.shuffle(final_queries)
+        
+        print(f"Generated {len(final_queries)} search queries for event types {event_types}:")
+        for i, query in enumerate(final_queries, 1):
+            print(f"  {i}. {query}")
+        
+        return final_queries
+
+    # Add a new method to filter kid-friendly events
+    def is_kid_friendly_event(self, event):
+        """
+        Check if an event is kid-friendly based on title and description.
+        
+        Args:
+            event (dict): Event data
+        
+        Returns:
+            bool: True if event appears to be kid-friendly
+        """
+        
+        # Kid-friendly keywords to look for
+        kid_friendly_keywords = [
+            'kids', 'children', 'child', 'family', 'toddler', 'infant', 
+            'preschool', 'kid-friendly', 'family-friendly', 'child-friendly',
+            'little ones', 'young children', 'babies', 'youth', 'junior',
+            'all ages', 'ages', 'elementary', 'kindergarten'
+        ]
+        
+        # Adult-only or inappropriate keywords to exclude
+        exclude_keywords = [
+            'adults only', 'adult', '21+', '18+', 'mature', 'wine', 'beer', 
+            'cocktail', 'bar', 'nightclub', 'dating', 'singles', 'romantic',
+            'bachelor', 'bachelorette', 'casino', 'gambling'
+        ]
+        
+        # Get text to analyze
+        title = event.get('title', '').lower()
+        description = event.get('description', '').lower()
+        venue_name = event.get('venue_name', '').lower()
+        
+        # Combine all text
+        full_text = f"{title} {description} {venue_name}"
+        
+        # Check for exclude keywords first
+        for exclude_word in exclude_keywords:
+            if exclude_word in full_text:
+                return False
+        
+        # Check for kid-friendly keywords
+        for keyword in kid_friendly_keywords:
+            if keyword in full_text:
+                return True
+        
+        # Special cases - venues that are typically kid-friendly
+        kid_friendly_venues = [
+            'museum', 'aquarium', 'zoo', 'park', 'library', 'community center',
+            'recreation center', 'ymca', 'playground', 'nature center'
+        ]
+        
+        for venue_type in kid_friendly_venues:
+            if venue_type in full_text:
+                return True
+        
+        #print(f"event: {event}")
+        #print(f"full_text: {full_text}")
+        # If no explicit kid-friendly indicators found, be conservative
+        return False
+
+    # Update the async_search_events method to include filtering
+    async def async_search_events(self, city_and_state, event_types, date_range, page):
+        """Search for events using SERP API with parallel execution and kid-friendly filtering."""
+        print(f"Searching for events in {city_and_state}")
+        
+        try:
+            # Build optimized search queries
+            search_queries = self.build_kid_friendly_search_queries(event_types, city_and_state)[:3]
+            
+            print(f"Executing {len(search_queries)} searches in parallel...")
+            
+            # Create a function to execute a single search query
+            def execute_single_search(query):
+                """Execute a single search query - runs in thread pool."""
+                try:
+                    #print(f"Executing search query: {query}")
+                    
+                    params = {
+                        "engine": "google_events",
+                        "q": query,
+                        "api_key": SERP_API_KEY,
+                        "hl": "en",
+                        "gl": "us"
+                    }
+                    
+                    #print(f"params: {params}")
+                    #if city_and_state:
+                     #   params["location"] = f"{city_and_state}, United States"
+
+                    # Add date filtering
+                    if date_range and isinstance(date_range, list):
+                        date_filters = [f"date:{date_item}" for date_item in date_range]
+                        params["htichips"] = ",".join(date_filters)
+
+                    start_time = time.time()
+                    search_results = serpapi.search(params)
+                    end_time = time.time()
+
+                    print(f"SERP API call for '{query}' took {end_time - start_time:.2f} seconds")
+
+                    # Extract events from results
+                    events = search_results.get('events_results', [])
+                    #print(f"Found {len(events)} events for query: {query}")
+
+                    # Process events for this query
+                    processed_events = []
+                    kid_friendly_events = []
+                    
+                    for event in events:
+                        processed_event = self.process_event_data(event)
+                        if processed_event:
+                            processed_events.append(processed_event)
+                            
+                            # Filter for kid-friendly events
+                            if self.is_kid_friendly_event(processed_event):
+                                kid_friendly_events.append(processed_event)
+
+                    print(f"Filtered to {len(kid_friendly_events)} kid-friendly events from {len(processed_events)} total")
+
+                    return {
+                        'query': query,
+                        'events': kid_friendly_events,  # Return only kid-friendly events
+                        'total_found': len(processed_events),
+                        'kid_friendly_found': len(kid_friendly_events),
+                        'success': True,
+                        'execution_time': end_time - start_time
+                    }
+                    
+                except Exception as e:
+                    print(f"Error with query '{query}': {e}")
+                    return {
+                        'query': query,
+                        'events': [],
+                        'total_found': 0,
+                        'kid_friendly_found': 0,
+                        'success': False,
+                        'error': str(e)
+                    }
+
+            # Execute all searches in parallel
+            overall_start_time = time.time()
+            all_events = []
+            total_found = 0
+            total_kid_friendly = 0
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(search_queries), 5)) as executor:
+                # Submit all search tasks
+                future_to_query = {
+                    executor.submit(execute_single_search, query): query 
+                    for query in search_queries
+                }
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_query):
+                    query = future_to_query[future]
+                    try:
+                        result = future.result()
+                        
+                        if result['success']:
+                            all_events.extend(result['events'])
+                            total_found += result['total_found']
+                            total_kid_friendly += result['kid_friendly_found']
+                            
+                            print(f"Query '{query}': {result['kid_friendly_found']}/{result['total_found']} "
+                                  f"kid-friendly events (took {result['execution_time']:.2f}s)")
+                        else:
+                            print(f"Failed to process query '{query}': {result.get('error', 'Unknown error')}")
+                            
+                    except Exception as exc:
+                        print(f"Query '{query}' generated an exception: {exc}")
+
+            overall_end_time = time.time()
+            total_execution_time = overall_end_time - overall_start_time
+            
+            print(f"Parallel execution completed in {total_execution_time:.2f} seconds")
+            print(f"Total events found: {total_found}, Kid-friendly: {total_kid_friendly}")
+            
+            # Remove duplicates based on event ID
+            unique_events = []
+            seen_events = set()
+            
+            for event in all_events:
+                event_key = event.get('id', '')
+                
+                if event_key and event_key not in seen_events:
+                    seen_events.add(event_key)
+                    unique_events.append(event)
+
+            print(f"Total unique kid-friendly events: {len(unique_events)} (from {len(all_events)} total)")
+            
+            return unique_events
+
+        except Exception as e:
+            print(f"Error in parallel search execution: {e}")
+            traceback.print_exc()
+            return []
