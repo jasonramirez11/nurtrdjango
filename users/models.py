@@ -33,6 +33,11 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     favorites = models.TextField(default='{}')  # Store favorites as JSON string to preserve exact IDs
+    
+    # Location-based recommendation fields
+    homebaseZipCode = models.CharField(max_length=10, blank=True, null=True, help_text="User's primary/home zip code for personalized recommendations")
+    location_preferences = models.JSONField(default=list, help_text="User's preferred locations for recommendations (zip codes)")
+    search_history_locations = models.JSONField(default=list, help_text="Historical locations user has searched (zip codes)")
 
     objects = UserManager()
     USERNAME_FIELD = 'email'

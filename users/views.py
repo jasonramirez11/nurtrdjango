@@ -11,10 +11,10 @@ class UserCreateView(generics.CreateAPIView):
 class ChildViewSet(viewsets.ModelViewSet):
     queryset = Child.objects.all()
     serializer_class = ChildSerializer
-    permission_classes = []  
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user_id = self.request.query_params.get('user')  
-        if user_id:
-            return Child.objects.filter(user_id=user_id)
-        return super().get_queryset()
+        return Child.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)

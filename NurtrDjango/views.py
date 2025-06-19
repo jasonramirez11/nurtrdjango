@@ -36,15 +36,30 @@ from dotenv import load_dotenv
 import os
 import traceback
 import serpapi
-from .models import Place # Import the Place model
+from .models import Place, Event, UserEventRecommendation, UserRecommendationEvent # Import the models
 from django.core.exceptions import ObjectDoesNotExist
 from asgiref.sync import sync_to_async
 import concurrent.futures
 import logging
 import json
 from datetime import datetime, timedelta
+from google import genai  # Add this import for Gemini LLM integration
+from users.models import Child  # Add this import
+from .models import UserRecommendation, UserRecommendationPlace  # Add this import
+import hashlib
+from pydantic import BaseModel
+from typing import List
 
 load_dotenv()
+
+# Pydantic models for Gemini structured output
+class PlaceRecommendation(BaseModel):
+    index: int
+    score: int
+    explanation: str
+
+class PlaceRecommendations(BaseModel):
+    recommendations: List[PlaceRecommendation]
 
 IP_INFO_API_TOKEN = os.getenv("IP_INFO_API_TOKEN")
 IMAGE_DOWNLOAD_URL = os.getenv("IMAGE_DOWNLOAD_URL")
@@ -1136,12 +1151,13 @@ class PlacesAPIView(APIView):
 
         return Response(place_details, status=HTTP_200_OK)
 
-    async def async_fetch_all_places(self, params, session, max_results=60):
+    async def async_fetch_all_places(self, params, session, max_results=60, queries=None):
         """Fetches all places asynchronously using the new Places API v2."""
-        print(f"SERPAPI API Key: {SERP_API_KEY}")
 
         radius = params["radius"]
         location = params["location"]
+
+        print(f"Radius: {radius}, Location: {location}")
 
         # Convert radius to zoom level
         # Significantly adjusted conversion formula for tighter results
@@ -1178,7 +1194,7 @@ class PlacesAPIView(APIView):
 
         start_val = 1 if params.get("load_more", False) else 0
 
-        def fetch_page_sync(query_str, category_val, start_val=start_val):
+        def fetch_page_sync(query_str, category_val=None, start_val=start_val):
             page_params_sync = base_params.copy()
             if start_val > 0:
                 page_params_sync["start"] = str(start_val)
@@ -1190,32 +1206,39 @@ class PlacesAPIView(APIView):
                 # Direct blocking call to serpapi
                 search_result_sync = serpapi.search(page_params_sync)
                 results_sync = search_result_sync.get('local_results', [])
-                for res_item in results_sync:
-                    res_item['category'] = category_val
+
+                if category_val:
+                    for res_item in results_sync:
+                        res_item['category'] = category_val
+
                 return results_sync
             except Exception as e_sync:
                 print(f"Error fetching results with params {page_params_sync}: {e_sync}")
                 return []
 
-        types = params["types"]
+        print(f"Queries: {queries}")
+        #input("Press Enter to continue...")
+        
         query_to_category = {}
-        if len(types.keys()) == 1:
-            type_list = list(types.values())[0]
-            # Ensure type_group_size is at least 1 to avoid issues with small lists
-            type_group_size = len(type_list) // 3 if len(type_list) // 3 > 0 else 1
-            types_groups = [type_list[i:i+type_group_size] for i in range(0, len(type_list), type_group_size)]
-            queries = [f"{' OR '.join(group)}" for group in types_groups if group] # Ensure group is not empty
-            for query_item in queries:
-                query_to_category[query_item] = list(types.keys())[0]
-        else:
-            queries = []
-            max_queries_per_type = 10 #This can be adjusted
-            for category_item, curr_types in types.items():
-                # Ensure curr_types is not empty before join
-                if curr_types:
-                    new_query = f"{' OR '.join(curr_types[:max_queries_per_type])}"
-                    query_to_category[new_query] = category_item
-                    queries.append(new_query)
+        if not queries:
+            types = params["types"]
+            if len(types.keys()) == 1:
+                type_list = list(types.values())[0]
+                # Ensure type_group_size is at least 1 to avoid issues with small lists
+                type_group_size = len(type_list) // 3 if len(type_list) // 3 > 0 else 1
+                types_groups = [type_list[i:i+type_group_size] for i in range(0, len(type_list), type_group_size)]
+                queries = [f"{' OR '.join(group)}" for group in types_groups if group] # Ensure group is not empty
+                for query_item in queries:
+                    query_to_category[query_item] = list(types.keys())[0]
+            else:
+                queries = []
+                max_queries_per_type = 10 #This can be adjusted
+                for category_item, curr_types in types.items():
+                    # Ensure curr_types is not empty before join
+                    if curr_types:
+                        new_query = f"{' OR '.join(curr_types[:max_queries_per_type])}"
+                        query_to_category[new_query] = category_item
+                        queries.append(new_query)
 
         print(f"{len(queries)} queries: {queries}")
 
@@ -1226,10 +1249,17 @@ class PlacesAPIView(APIView):
             num_workers = min(len(queries), 5)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {
-                    executor.submit(fetch_page_sync, q, query_to_category[q]): q 
-                    for q in queries
-                }
+                
+                if query_to_category:
+                    futures = {
+                        executor.submit(fetch_page_sync, q, category_val=query_to_category[q]): q 
+                        for q in queries
+                    }
+                else:
+                    futures = {
+                        executor.submit(fetch_page_sync, q): q 
+                        for q in queries
+                    }
                 
                 # Process results as they complete
                 for future in concurrent.futures.as_completed(futures):
@@ -1246,10 +1276,6 @@ class PlacesAPIView(APIView):
         end_time = time.time()
         print(f"Time taken to fetch all pages: {end_time - start_time} seconds")
         
-        # Combine results from all pages (all_api_results now holds all items)
-        # The original page_results variable might be overwritten or differently used below,
-        # this example focuses on collecting into all_api_results.
-        # Ensure downstream code uses all_api_results.
         unique_results = {}
         for result in all_api_results:
             place_id = result.get("place_id")
@@ -1288,6 +1314,8 @@ class PlacesAPIView(APIView):
         # List to store filtered results
         filtered_results = []
 
+        num_results_filtered_out = 0
+        print(f"Unique results: {len(unique_results)}")
         # Format results to match prev structure for now
         for result in unique_results:
             try:
@@ -1302,7 +1330,8 @@ class PlacesAPIView(APIView):
                 radius_miles = radius / 1609.34  # 1609.34 meters in a mile
                 
                 if distance_miles > radius_miles:
-                    print(f"Filtering out result {result.get('title')} - distance {distance_miles} miles exceeds radius {radius_miles} miles")
+                    print(f"Result {result['title']} is outside radius {radius_miles} miles")
+                    num_results_filtered_out += 1
                     continue
                     
                 result['displayName'] = {
@@ -1313,93 +1342,10 @@ class PlacesAPIView(APIView):
                 filtered_results.append(result)
             except Exception as e:
                 print(f"Error processing result {result}: {e}")
+            
+        print(f"Num results filtered out: {num_results_filtered_out}")
                 
         return filtered_results[:max_results]
-
-    async def async_fetch_all_places_prev(self, params, session):
-        """Fetches all pages asynchronously using the new Places API v1."""
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": self.API_KEY,
-            "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.businessStatus,places.photos,places.formattedAddress,places.priceRange,places.types,places.userRatingCount,places.rating",  # Include places.id
-        }
-
-        # Get the list of types from params, default to ["restaurant"]
-        types = params.get("types", ["restaurant"])
-        
-        # Split types into 3 groups using modulo operator
-        group_0 = [types[i] for i in range(len(types)) if i % 3 == 0]
-        group_1 = [types[i] for i in range(len(types)) if i % 3 == 1]
-        group_2 = [types[i] for i in range(len(types)) if i % 3 == 2]
-
-        # Function to fetch results for a group of types
-        async def fetch_group(group_types):
-            if not group_types:
-                return []
-
-            print(f"Fetching group: {group_types}") 
-
-            request_body = {
-                "locationRestriction": {
-                    "circle": {
-                        "center": {
-                            "latitude": float(params["location"].split(",")[0]),
-                            "longitude": float(params["location"].split(",")[1]),
-                        },
-                        "radius": params["radius"],
-                    }
-                },
-                "includedTypes": group_types,
-                "maxResultCount": 2 if TESTING else 17,
-            }
-
-            print(f"max result count is {5 if TESTING else 17}")
-
-            all_results = []
-            next_page_token = None
-
-            while True:
-                if next_page_token:
-                    request_body["pageToken"] = next_page_token
-                    await asyncio.sleep(2)  # Google recommends a short delay between paginated requests
-
-                async with session.post(self.BASE_URL, json=request_body, headers=headers) as response:
-                    data = await response.json()
-                
-                all_results.extend(data.get("places", []))
-
-                next_page_token = data.get("nextPageToken")
-                if not next_page_token or len(all_results) >= 20:
-                    break
-            
-            return all_results
-
-        # Fetch results for all 3 groups concurrently
-        results = await asyncio.gather(
-            fetch_group(group_0),
-            fetch_group(group_1),
-            fetch_group(group_2)
-        )
-
-        # Combine results from all groups
-        all_results = [item for sublist in results for item in sublist]
-
-        print('Example result:', all_results[0] if all_results else "No results found")
-        print(f"results 0: {len(results[0])}")
-        print(f"results 1: {len(results[1])}")
-        print(f"results 2: {len(results[2])}")
-
-        print(f"num results for all 3 groups {len(all_results)}")
-
-        # Remove duplicates based on place ID
-        unique_results = []
-        seen_ids = set()
-        for result in all_results:
-            if result["id"] not in seen_ids:
-                unique_results.append(result)
-                seen_ids.add(result["id"])
-
-        return unique_results
 
     async def async_fetch_all_place_details(self, places, filters, min_price, max_price, session):
         """Fetch all place details concurrently using asyncio.gather."""
@@ -2380,3 +2326,2561 @@ class EventsAPIView(APIView):
             print(f"Error in parallel search execution: {e}")
             traceback.print_exc()
             return []
+
+class RecommendedPlacesAPIView(APIView):
+    """
+    Personalized place recommendations endpoint for authenticated users.
+    
+    - GET: Retrieve user's latest recommended places (for frontend display)
+    - POST: Generate/refresh personalized recommendations for a user
+    """
+    permission_classes = [IsAuthenticated]  # Simplified - always require authentication
+    parser_classes = [JSONParser]
+
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+    def get(self, request):
+        """
+        Get the latest recommended places for the authenticated user.
+        This endpoint is designed for frontend consumption - returns full place data
+        for the user's most recent daily recommendations.
+        """
+        print(f"🔍 GET /places/recommended/ called by user: {request.user.email} (ID: {request.user.id})")
+        
+        if not request.user.is_authenticated:
+            print(f"❌ User not authenticated")
+            return Response({"error": "Authentication required"}, status=401)
+        
+        return self._get_user_latest_recommendations(request.user)
+    
+    def _get_user_latest_recommendations(self, user):
+        """Get the latest recommended places for an authenticated user."""
+        start_time = time.time()
+        print(f"🔍 _get_user_latest_recommendations called for user: {user.email} (ID: {user.id})")
+        
+        try:
+            # Check if user has any children first (recommendations are based on children)
+            from users.models import Child
+            children = Child.objects.filter(user=user)
+            print(f"👶 User has {children.count()} children: {[child.name for child in children]}")
+            
+            # Get total count of UserRecommendation objects in database
+            total_recommendations = UserRecommendation.objects.count()
+            print(f"📊 Total UserRecommendation objects in database: {total_recommendations}")
+            
+            # Get user's latest recommendation
+            user_recommendations = UserRecommendation.objects.filter(user=user)
+            print(f"📊 UserRecommendation objects for this user: {user_recommendations.count()}")
+            
+            latest_recommendation = user_recommendations.order_by('-date_generated').first()
+            print(f"📅 Latest recommendation for user: {latest_recommendation}")
+            
+            if not latest_recommendation:
+                print(f"❌ No recommendations found for user {user.email}")
+                return Response({
+                    "message": "No recommendations found. Please make a POST request to generate recommendations.",
+                    "results": [],
+                    "total_results": 0
+                }, status=HTTP_200_OK)
+            
+            # Get all recommended places with full data
+            from .models import UserRecommendationPlace
+            recommended_places = []
+            recommendation_places = UserRecommendationPlace.objects.filter(
+                user_recommendation=latest_recommendation
+            ).select_related('place').order_by('recommendation_rank')
+            
+            print(f"✅ Found recommendation from {latest_recommendation.date_generated} with {recommendation_places.count()} places")
+            
+            for rec_place in recommendation_places:
+                place = rec_place.place
+                
+                # Build comprehensive place data
+                place_data = {
+                    # Core place information
+                    "place_id": place.place_id,
+                    "title": place.title,
+                    "name": place.title,  # For compatibility
+                    "description": place.description or "",
+                    "category": place.category or "",
+                    
+                    # Location data
+                    "location": {
+                        "latitude": float(place.latitude) if place.latitude else None,
+                        "longitude": float(place.longitude) if place.longitude else None
+                    },
+                    "gps_coordinates": {
+                        "latitude": float(place.latitude) if place.latitude else None,
+                        "longitude": float(place.longitude) if place.longitude else None
+                    },
+                    "address": place.address or "",
+                    "formattedAddress": place.formatted_address or "",
+                    "vicinity": place.formatted_address or "",  # For compatibility
+                    
+                    # Rating and review data
+                    "rating": place.rating,
+                    "reviews": place.reviews,
+                    "userRatingCount": place.reviews,  # For compatibility
+                    
+                    # Place metadata
+                    "types": place.types or [],
+                    "type": place.type or "",
+                    "extensions": place.extensions or {},
+                    "displayName": {"text": place.title} if place.title else None,
+                    
+                    # Visual content
+                    "imagePlaces": place.place_images or [],
+                    "place_images": place.place_images or [],  # For compatibility
+                    
+                    # Operating information
+                    "operating_hours": place.hours or {},
+                    "hours": place.hours or {},  # For compatibility
+                    "popular_times": place.popular_times or [],
+                    
+                    # Reviews data
+                    "reviews_list": place.reviews_list or [],
+                    "reviews_link": place.reviews_link or "",
+                    "photos_link": place.photos_link or "",
+                    
+                    # Recommendation-specific data
+                    "personalization_score": rec_place.personalization_score,
+                    "personalized_explanation": rec_place.personalized_explanation,
+                    "searched_location": rec_place.searched_location,
+                    "source_query": rec_place.source_query,
+                    "recommendation_rank": rec_place.recommendation_rank,
+                    
+                    # Metadata
+                    "data_id": place.data_id or "",
+                    "source": "database_recommendation"
+                }
+                recommended_places.append(place_data)
+            
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            
+            return Response({
+                "results": recommended_places,
+                "total_results": len(recommended_places),
+                "recommendation_metadata": {
+                    "date_generated": latest_recommendation.date_generated.isoformat(),
+                    "custom_queries": latest_recommendation.custom_queries,
+                    "locations_searched": latest_recommendation.locations_searched,
+                    "user_profile_hash": latest_recommendation.user_profile_hash,
+                    "created_at": latest_recommendation.created_at.isoformat(),
+                    "updated_at": latest_recommendation.updated_at.isoformat()
+                },
+                "execution_time_ms": execution_time,
+                "cached": True,
+                "message": f"Latest recommendations from {latest_recommendation.date_generated}"
+            }, status=HTTP_200_OK)
+            
+        except Exception as e:
+            print(f"Error getting latest recommendations for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def post(self, request):
+        """
+        Get personalized recommendations for the authenticated user.
+        Returns cached results if available and fresh, otherwise generates new ones.
+        """
+        start_time = time.time()
+        
+        try:
+            user = request.user
+            print(f"Getting recommendations for user: {user.email}")
+            
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+
+            print(f"Children: {children}")
+            
+            # Get location data from request
+            data = request.data
+            zip_code = data.get("zip_code")
+            latitude = data.get("latitude", 40.712776)
+            longitude = data.get("longitude", -74.005974)
+            radius = data.get("radius", 500)
+            force_refresh = data.get("force_refresh", False)
+            is_homebase = data.get("is_homebase", False)  # Flag to indicate this is a homebase update
+            
+            # Get coordinates from zip if provided
+            if zip_code:
+                latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
+                if not latitude or not longitude:
+                    return Response({"error": "Invalid ZIP code"}, status=HTTP_400_BAD_REQUEST)
+            
+            # Update user's homebase if this is a homebase update
+            if is_homebase and zip_code:
+                try:
+                    user.homebaseZipCode = zip_code
+                    user.save()
+                    print(f"✅ Updated homebase for {user.email} to {zip_code}")
+                except Exception as e:
+                    print(f"⚠️ Failed to update homebase for {user.email}: {e}")
+                    # Don't fail the entire request if homebase update fails
+            
+            # Add this location to user's search history for future recommendations
+            location_key = zip_code or f"{latitude},{longitude}"
+            self.add_location_to_search_history(user, location_key)
+            
+            print(f"Zip code: {zip_code}")
+            print(f"Latitude: {latitude}")
+            print(f"Longitude: {longitude}")
+            print(f"Radius: {radius}")
+            print(f"Force refresh: {force_refresh}")
+            
+            # Check for today's cached recommendations first (unless force_refresh is True)
+            if not force_refresh:
+                cached_recommendation = self.get_cached_recommendations(user)
+                if cached_recommendation:
+                    execution_time = round((time.time() - start_time) * 1000, 2)
+                    print(f"✅ Returning today's cached recommendations for {user.email}")
+                    
+                    # Convert the related places back to the expected JSON format
+                    from .models import UserRecommendationPlace
+                    recommended_places = []
+                    recommendation_places = UserRecommendationPlace.objects.filter(
+                        user_recommendation=cached_recommendation
+                    ).select_related('place').order_by('recommendation_rank')
+                    
+                    for rec_place in recommendation_places:
+                        place = rec_place.place
+                        place_data = {
+                            "place_id": place.place_id,
+                            "title": place.title,
+                            "name": place.title,  # For compatibility
+                            "description": place.description,
+                            "rating": place.rating,
+                            "reviews": place.reviews,
+                            "formattedAddress": place.formatted_address,
+                            "vicinity": place.formatted_address,  # For compatibility
+                            "types": place.types,
+                            "imagePlaces": place.place_images,
+                            "category": place.category,
+                            "location": {
+                                "latitude": float(place.latitude) if place.latitude else None,
+                                "longitude": float(place.longitude) if place.longitude else None
+                            },
+                            "gps_coordinates": {
+                                "latitude": float(place.latitude) if place.latitude else None,
+                                "longitude": float(place.longitude) if place.longitude else None
+                            },
+                            # Recommendation-specific data
+                            "personalization_score": rec_place.personalization_score,
+                            "personalized_explanation": rec_place.personalized_explanation,
+                            "searched_location": rec_place.searched_location,
+                            "source_query": rec_place.source_query,
+                            "recommendation_rank": rec_place.recommendation_rank
+                        }
+                        recommended_places.append(place_data)
+                    
+                    return Response({
+                        "results": recommended_places,
+                        "custom_queries": cached_recommendation.custom_queries,
+                        "locations_searched": cached_recommendation.locations_searched,
+                        "total_results": cached_recommendation.total_results,
+                        "execution_time_ms": execution_time,
+                        "cached": True,
+                        "date_generated": cached_recommendation.date_generated.isoformat(),
+                        "cache_updated": cached_recommendation.updated_at.isoformat()
+                    }, status=HTTP_200_OK)
+            
+            # Generate fresh daily recommendations
+            recommendation_data = self.generate_and_cache_daily_recommendations(user)
+            
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            recommendation_data["execution_time_ms"] = execution_time
+            recommendation_data["cached"] = False
+            
+            return Response(recommendation_data, status=HTTP_200_OK)
+            
+        except Exception as e:
+            print(f"Error in recommendations: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def build_user_profile(self, user, children):
+        """Build a comprehensive user profile for LLM context."""
+        profile = {
+            "user_name": user.name or "Parent",
+            "email": user.email,
+            "favorites": json.loads(user.favorites) if user.favorites else {},
+            "children": []
+        }
+        
+        for child in children:
+            child_data = {
+                "name": child.name,
+                "age": child.age,
+                "interests": child.interests or [],
+                "age_group": self.get_age_group(child.age)
+            }
+            profile["children"].append(child_data)
+        
+        # Add derived insights
+        profile["total_children"] = len(children)
+        profile["age_ranges"] = list(set([self.get_age_group(child.age) for child in children]))
+        profile["all_interests"] = list(set([interest for child in children for interest in (child.interests or [])]))
+        
+        return profile
+
+    def get_age_group(self, age):
+        """Categorize children by age group for better recommendations."""
+        if age <= 2:
+            return "toddler"
+        elif age <= 5:
+            return "preschooler"
+        elif age <= 8:
+            return "early_elementary"
+        elif age <= 12:
+            return "late_elementary"
+        else:
+            return "preteen"
+
+    def generate_llm_queries(self, user_profile, location):
+        """Use Gemini to generate personalized search queries based on user profile."""
+        try:
+            client = genai.Client(api_key=self.GEMINI_API_KEY)
+            
+            prompt = f"""
+            You are a family activity recommendation expert. Based on the user profile below, generate 5-7 specific search queries to use for Google Maps search to find the best family places and activities.
+
+            User Profile:
+            - Parent: {user_profile['user_name']}
+            - Number of children: {user_profile['total_children']}
+            - Children details: {json.dumps(user_profile['children'], indent=2)}
+            - Age groups represented: {', '.join(user_profile['age_ranges'])}
+            - Combined interests: {', '.join(user_profile['all_interests'])}
+
+            Guidelines:
+            1. Create queries that match the children's ages and interests
+            2. Consider safety and age-appropriateness
+            3. Include both indoor and outdoor options
+            4. Mix popular activities with unique local experiences
+            5. Each query should be 3-7 words
+            6. Focus on kid-friendly venues that welcome families
+
+            Return only a JSON array of search query strings, like:
+            ["family indoor play center", "toddler-friendly museums", "outdoor playgrounds"]
+            """
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+            #print(f"Gemini response: {response}")
+
+            # Parse Gemini response
+            llm_output = response.text.strip()
+            #print(f"Gemini raw output: {llm_output}")
+            
+            # Try to extract JSON array from response
+            try:
+                # Sometimes Gemini includes markdown formatting, so let's clean it
+                if "```json" in llm_output:
+                    llm_output = llm_output.split("```json")[1].split("```")[0].strip()
+                elif "```" in llm_output:
+                    llm_output = llm_output.split("```")[1].strip()
+                
+                custom_queries = json.loads(llm_output)
+                if isinstance(custom_queries, list):
+                    return custom_queries[:7]  # Limit to 7 queries
+            except json.JSONDecodeError:
+                print("Failed to parse Gemini JSON, using fallback")
+            
+        except Exception as e:
+            print(f"Gemini generation failed: {e}")
+        
+        # Fallback queries if LLM fails
+        return self.generate_fallback_queries(user_profile)
+
+    def generate_fallback_queries(self, user_profile):
+        """Generate fallback queries based on user profile without LLM."""
+        queries = []
+        interests = user_profile['all_interests']
+        age_groups = user_profile['age_ranges']
+        
+        # Base queries for different interests
+        interest_mapping = {
+            "Parks": "family parks playgrounds",
+            "Nature": "nature centers outdoor kids",
+            "Animals": "petting zoos aquariums kids",
+            "Creative": "kids art classes creative",
+            "Sports": "family sports activities kids",
+            "STEM": "science museums kids STEM",
+            "Food": "family restaurants kids menu",
+            "Play Centers": "indoor play centers kids",
+            "Playgrounds": "playgrounds family outdoor"
+        }
+        
+        # Add interest-based queries
+        for interest in interests[:4]:  # Limit to top 4 interests
+            if interest in interest_mapping:
+                queries.append(interest_mapping[interest])
+        
+        # Add age-appropriate queries
+        if "toddler" in age_groups:
+            queries.append("toddler friendly activities")
+        if "preschooler" in age_groups:
+            queries.append("preschool kids activities")
+        if any(age in age_groups for age in ["early_elementary", "late_elementary"]):
+            queries.append("elementary kids activities")
+        
+        return queries[:6] if queries else ["family activities kids", "playgrounds parks", "kids museums"]
+
+    async def get_recommended_places(self, custom_queries, latitude, longitude, radius):
+        """Use existing places search infrastructure with custom queries."""
+        all_places = []
+        
+        print(f"Getting recommended places for {custom_queries} with radius {radius} at {latitude},{longitude}")
+
+        # Convert custom queries into the format expected by existing search
+            
+        search_params = {
+            "location": f"{latitude},{longitude}",
+            "radius": radius,
+            "key": PlacesAPIView.API_KEY
+        }
+
+        curr_query = ' OR '.join(custom_queries[:2])
+            
+        try:
+            places_api = PlacesAPIView()
+            async with aiohttp.ClientSession() as session:
+                results = await places_api.async_fetch_all_places(search_params, session, max_results=15, queries=[curr_query])
+                
+            # Process images for each place using the existing pipeline
+            if results:
+                print(f"Processing images for {len(results)} places from recommendations...")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_place = {
+                        executor.submit(process_images_for_place, place): place
+                        for place in results
+                    }
+                    
+                    for future in as_completed(future_to_place):
+                        place = future_to_place[future]
+                        try:
+                            processed_urls = future.result()
+                            if processed_urls:
+                                place["imagePlaces"] = processed_urls
+                                print(f"Processed {len(processed_urls)} images for place {place.get('place_id', 'unknown')}")
+                            else:
+                                place["imagePlaces"] = []
+                        except Exception as e:
+                            print(f"Error processing images for place {place.get('place_id', 'unknown')}: {e}")
+                            place["imagePlaces"] = []
+                
+            for place in results:
+                place["source_query"] = curr_query
+                all_places.append(place)
+
+        except Exception as e:
+            print(f"Error searching with query '{curr_query}': {e}")
+        
+        # Remove duplicates based on place_id
+        unique_places = []
+        seen_ids = set()
+        for place in all_places:
+            place_id = place.get("place_id")
+            if place_id and place_id not in seen_ids:
+                seen_ids.add(place_id)
+                unique_places.append(place)
+        
+        return unique_places
+
+    def score_places_for_user(self, places, user_profile):
+        """Add personalization scores and explanations using Gemini AI based on how well places match user profile."""
+        if not places:
+            return places
+
+        try:
+            print(f"Scoring {len(places)} places for user profile: {user_profile}")
+            gemini_api_key = os.environ.get('GEMINI_API_KEY')
+            if not gemini_api_key:
+                raise Exception("Missing GEMINI_API_KEY environment variable")
+
+            client = genai.Client(api_key=gemini_api_key)
+
+            # Process places in batches to avoid token limits
+            batch_size = 20
+            for i in range(0, len(places), batch_size):
+                batch = places[i:i + batch_size]
+
+                # Prepare batch data for Gemini
+                places_data = []
+                for idx, place in enumerate(batch):
+                    place_info = {
+                        "index": i + idx,
+                        "name": place.get('title', 'Unknown'),
+                        "description": place.get('description', ''),
+                        "category": place.get('category', ''),
+                        "types": place.get('types', []),
+                        "rating": place.get('rating', 0),
+                        "reviews": place.get('reviews', 0) or place.get('userRatingCount', 0),
+                        "address": place.get('formattedAddress', place.get('address', ''))
+                    }
+                    places_data.append(place_info)
+
+                # Create the prompt
+                child_count = user_profile.get('total_children', 1)
+                child_plural = "children" if child_count > 1 else "child"
+                
+                prompt = f"""
+                You are a family activity recommendation expert. Analyze these places and provide personalization scores (0-100) and engaging explanations for why each place would be perfect for this parent and their family.
+            
+                FAMILY PROFILE:
+                - Number of children: {child_count}
+                - Child ages/stages: {', '.join(user_profile.get('age_ranges', []))}
+                - Family interests: {', '.join(user_profile.get('all_interests', []))}
+                - Location: {user_profile.get('location', 'Not specified')}
+            
+                PLACES TO ANALYZE:
+                {json.dumps(places_data, indent=2)}
+            
+                For each place, provide:
+                1. A personalization score (0-100) based on how well it matches the family's interests, ages, and preferences
+                2. A fun, engaging explanation (2-3 sentences) written directly to the parent but focused on what their {child_plural} will experience and enjoy
+            
+                IMPORTANT GUIDELINES:
+                - Write explanations directly to the parent (use "you", "your little ones", "your tiny explorers")
+                - Focus primarily on what the {child_plural} will experience, enjoy, and benefit from at this place
+                - Use fun, endearing terms like "little adventurers", "tiny explorers", "little scientists", "mini athletes", "creative spirits", "curious minds"
+                - Reference the number of children when relevant (e.g., "your {child_count} little adventurers will love...")
+                - DO NOT mention any specific names - only refer to fun, age-appropriate descriptors
+                - Emphasize the child-centered benefits: fun activities, learning opportunities, physical play, creativity
+                - Mention age-appropriate aspects and why they're perfect for their children's developmental stage
+                - Keep tone enthusiastic, playful, and child-focused with warm, friendly language
+                - Use action words that show excitement: "zoom", "splash", "discover", "create", "explore", "adventure"
+                
+                EXAMPLE EXPLANATIONS:
+                - Indoor Playground: "Your little adventurers will absolutely love this vibrant indoor playground! With climbing structures perfectly sized for early elementary explorers, they'll spend hours zooming through tunnels, conquering obstacle courses, and making new friends in this safe, magical play wonderland."
+                - Science Museum: "This hands-on science museum is perfect for your curious little scientists! Your tiny explorers will be amazed by interactive exhibits where they can conduct real experiments, touch actual fossils, and discover how the world works through exciting play-based adventures."
+                - Adventure Park: "Your active little athletes will have an absolute blast at this outdoor adventure park! These mini daredevils will challenge themselves on age-appropriate zip lines, navigate thrilling obstacle courses, and build confidence while soaking up sunshine and fresh air fun."
+            
+                Consider:
+                - Age appropriateness for their children's developmental stages
+                - How well the place matches their stated interests
+                - Safety and family-friendliness from a parent's perspective
+                - Educational value and developmental benefits
+                - Entertainment value and engagement potential
+                - Practical considerations (parking, facilities, etc.)
+            
+                Respond in this exact JSON format:
+                {{
+                  "recommendations": [
+                    {{
+                      "index": 0,
+                      "score": 85,
+                      "explanation": "This indoor playground is perfect for your active family! With age-appropriate play structures designed for early elementary children, it offers a safe environment where your {child_plural} can burn energy while you relax knowing they're in a secure, well-maintained space."
+                    }}
+                  ]
+                }}
+                """
+
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config={
+                            "response_mime_type": "application/json",
+                            "response_schema": PlaceRecommendations,
+                        },
+                    )
+
+                    print(f"Gemini response: {response}")
+
+                    # Use structured output - response.parsed contains the validated data
+                    result = response.parsed
+                    
+                    # Apply scores and explanations to places
+                    for recommendation in result.recommendations:
+                        place_index = recommendation.index
+                        actual_index = place_index - i  # Adjust for batch offset
+
+                        if 0 <= actual_index < len(batch):
+                            batch[actual_index]["personalization_score"] = recommendation.score
+                            batch[actual_index]["personalized_explanation"] = recommendation.explanation
+
+                except Exception as e:
+                    print(f"Error with Gemini API for batch {i // batch_size + 1}: {e}")
+                    # Fallback to simple scoring for this batch
+                    for place in batch:
+                        fallback_score = self._calculate_fallback_score(place, user_profile)
+                        place["personalization_score"] = fallback_score
+                        place["personalized_explanation"] = self._generate_fallback_explanation(place, user_profile)
+
+                # Small delay between batches to respect rate limits
+                if i + batch_size < len(places):
+                    time.sleep(0.5)
+
+        except Exception as e:
+            print(f"Error initializing Gemini for place scoring: {e}")
+            # Fallback to simple scoring for all places
+            for place in places:
+                fallback_score = self._calculate_fallback_score(place, user_profile)
+                place["personalization_score"] = fallback_score
+                place["personalized_explanation"] = self._generate_fallback_explanation(place, user_profile)
+
+        return places
+
+    def _calculate_fallback_score(self, place, user_profile):
+        """Fallback scoring method when Gemini is unavailable."""
+        score = 0
+
+        # Score based on children's interests
+        place_text = f"{place.get('title', '')} {place.get('description', '')} {place.get('category', '')}".lower()
+
+        for interest in user_profile['all_interests']:
+            if interest.lower() in place_text:
+                score += 10
+
+        # Score based on age appropriateness
+        age_keywords = {
+            "toddler": ["toddler", "baby", "infant", "crawl"],
+            "preschooler": ["preschool", "4 year", "5 year"],
+            "early_elementary": ["elementary", "school age"],
+            "late_elementary": ["kids", "children", "youth"]
+        }
+
+        for age_group in user_profile['age_ranges']:
+            if age_group in age_keywords:
+                for keyword in age_keywords[age_group]:
+                    if keyword in place_text:
+                        score += 5
+
+        # Boost score for highly rated places
+        rating = place.get('rating', 0)
+        if rating >= 4.5:
+            score += 15
+        elif rating >= 4.0:
+            score += 10
+        elif rating >= 3.5:
+            score += 5
+
+        # Boost score for places with reviews (more established)
+        review_count = place.get('reviews', 0) or place.get('userRatingCount', 0)
+        if review_count > 100:
+            score += 10
+        elif review_count > 50:
+            score += 5
+
+        return min(score, 100)  # Cap at 100
+
+    def _generate_fallback_explanation(self, place, user_profile):
+        """Generate a simple explanation when Gemini is unavailable."""
+        place_name = place.get('title', 'This place')
+        interests = user_profile.get('all_interests', [])
+        age_ranges = user_profile.get('age_ranges', [])
+
+        if 'Parks' in interests or 'Nature' in interests:
+            return f"{place_name} offers wonderful outdoor experiences perfect for your family's love of nature and active play!"
+        elif 'Art' in interests or 'Music' in interests:
+            return f"{place_name} provides creative and cultural experiences that will inspire your family's artistic interests!"
+        elif 'STEM' in interests:
+            return f"{place_name} offers educational and hands-on learning opportunities perfect for curious young minds!"
+        else:
+            return f"{place_name} is a great family-friendly destination that offers fun activities for children of all ages!"
+
+    def get_user_locations(self, user):
+        """Get up to 5 locations for recommendations (preferences first, then search history)."""
+        all_locations = []
+        
+        # First, add location preferences (priority)
+        if user.location_preferences:
+            all_locations.extend(user.location_preferences)
+        
+        # Then add search history locations
+        if user.search_history_locations:
+            for location in user.search_history_locations:
+                if location not in all_locations:  # Avoid duplicates
+                    all_locations.append(location)
+        
+        # Limit to 5 total locations (only using current homebase for now)
+        locations_to_use = all_locations[:1]
+        
+        # If user has no locations, use defaults
+        #if not locations_to_use:
+         #   locations_to_use = ["90210", "10001", "94102"]  # Default cities
+        
+        # Convert to the expected format with coordinates
+        location_data = {}
+        default_coords = {}
+        
+        for location in locations_to_use:
+            if location in default_coords:
+                location_data[location] = default_coords[location]
+            else:
+                # For unknown zip codes, try to geocode them
+                try:
+                    lat, lng = asyncio.run(self.get_coordinates_from_zip(location))
+                    if lat and lng:
+                        location_data[location] = {"latitude": lat, "longitude": lng}
+                except Exception as e:
+                    print(f"Error geocoding {location}: {e}")
+                    continue
+        
+        print(f"Using {len(location_data)} locations for {user.email}: {list(location_data.keys())}")
+        return location_data
+
+    def get_cached_recommendations(self, user):
+        """Get today's cached recommendations if they exist and are fresh."""
+        try:
+            today = datetime.now().date()
+            
+            cached = UserRecommendation.objects.filter(
+                user=user,
+                date_generated=today
+            ).first()
+            
+            if cached:
+                # Verify the user profile hasn't changed by comparing hash
+                children = Child.objects.filter(user=user)
+                current_profile = self.build_user_profile(user, children)
+                current_hash = self.get_profile_hash(current_profile)
+                
+                if cached.user_profile_hash == current_hash:
+                    return cached
+                else:
+                    print(f"User profile changed for {user.email}, invalidating today's cache")
+                    cached.delete()
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error checking cache for {user.email}: {e}")
+            return None
+
+    def get_profile_hash(self, user_profile):
+        """Generate a hash of the user profile for cache invalidation."""
+        # Create a stable string representation of the profile
+        profile_string = json.dumps(user_profile, sort_keys=True)
+        return hashlib.md5(profile_string.encode()).hexdigest()
+
+    def generate_and_cache_daily_recommendations(self, user):
+        """Generate daily aggregated recommendations from user's preferred and search history locations."""
+        try:
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+            
+            # Build user profile for LLM
+            user_profile = self.build_user_profile(user, children)
+            print(f"User profile for {user.email}: {user_profile}")
+            
+            # Get locations to search (preferences + history, max 5)
+            locations_to_process = self.get_user_locations(user)
+            
+            all_places = []
+            all_custom_queries = []
+            locations_searched = list(locations_to_process.keys())
+            
+            print(f"Locations to process: {locations_to_process}")
+            #input("Press Enter to continue...")
+
+            # Search across all user's locations
+            for location_key, location_data in locations_to_process.items():
+                try:
+                    latitude = location_data['latitude']
+                    longitude = location_data['longitude']
+                    
+                    # Generate custom search queries using LLM for this location
+                    location_queries = self.generate_llm_queries(user_profile, location_key)
+                    print(f"Location queries: {location_queries}")
+                    #input("Press Enter to continue...")
+                    all_custom_queries.extend(location_queries)
+                    
+                    # Get places for this location
+                    recommended_places = asyncio.run(self.get_recommended_places(
+                        location_queries, latitude, longitude, 20000
+                    ))
+                    
+                    # Add location info to each place
+                    for place in recommended_places:
+                        place['searched_location'] = location_key
+                    
+                    all_places.extend(recommended_places)
+                    print(f"Found {len(recommended_places)} places for {location_key}")
+                    
+                except Exception as e:
+                    print(f"Error searching location {location_key} for {user.email}: {e}")
+                    continue
+            
+            # Remove duplicates based on place_id
+            unique_places = []
+            seen_ids = set()
+            for place in all_places:
+                place_id = place.get("place_id")
+                if place_id and place_id not in seen_ids:
+                    seen_ids.add(place_id)
+                    unique_places.append(place)
+
+            print(f"Unique places: {len(unique_places)}")
+            #input("Press Enter to continue...")
+            
+            # Add personalization scores
+            scored_places = self.score_places_for_user(unique_places, user_profile)
+            
+            # Sort by personalization score
+            scored_places.sort(key=lambda x: x.get("personalization_score", 0), reverse=True)
+            
+            # Limit to top 15 for daily recommendations
+            daily_recommendations = scored_places[:15]
+            
+            # Cache the results for today
+            today = datetime.now().date()
+            profile_hash = self.get_profile_hash(user_profile)
+            
+            print(f"Updating or creating today's recommendation for {user.email}")
+            #input("Press Enter to continue...")
+            
+            # Update or create today's recommendation
+            cached_recommendation, created = UserRecommendation.objects.update_or_create(
+                user=user,
+                date_generated=today,
+                defaults={
+                    'user_profile_hash': profile_hash,
+                    'custom_queries': list(set(all_custom_queries)),  # Remove duplicates
+                    'locations_searched': locations_searched,
+                    'total_results': len(scored_places)
+                }
+            )
+            
+            # Clear existing places for this recommendation (in case of update)
+            if not created:
+                cached_recommendation.recommended_places.clear()
+            
+            # Create Place objects and UserRecommendationPlace relationships
+            from .models import UserRecommendationPlace
+            for rank, place_data in enumerate(daily_recommendations, 1):
+                try:
+                    print(f"Place title and location: {place_data.get('title', place_data.get('name', ''))} {place_data.get('location', {}).get('latitude') or place_data.get('gps_coordinates', {}).get('latitude')} {place_data.get('location', {}).get('longitude') or place_data.get('gps_coordinates', {}).get('longitude')}")
+
+                    print(f"place score explanation: {place_data.get('personalized_explanation', '')}")
+
+                    # Get or create the Place object
+                    place, place_created = Place.objects.get_or_create(
+                        place_id=place_data.get('place_id'),
+                        defaults={
+                            'title': place_data.get('title', place_data.get('name', '')),
+                            'description': place_data.get('description', ''),
+                            'latitude': place_data.get('location', {}).get('latitude') or place_data.get('gps_coordinates', {}).get('latitude'),
+                            'longitude': place_data.get('location', {}).get('longitude') or place_data.get('gps_coordinates', {}).get('longitude'),
+                            'rating': place_data.get('rating'),
+                            'reviews': place_data.get('reviews') or place_data.get('userRatingCount'),
+                            'formatted_address': place_data.get('formattedAddress', place_data.get('vicinity', '')),
+                            'types': place_data.get('types', []),
+                            'place_images': place_data.get('imagePlaces', []),
+                            'category': place_data.get('category', ''),
+                        }
+                    )
+                    
+                    # Create the recommendation relationship
+                    UserRecommendationPlace.objects.create(
+                        user_recommendation=cached_recommendation,
+                        place=place,
+                        personalization_score=place_data.get('personalization_score', 0),
+                        personalized_explanation=place_data.get('personalized_explanation', ''),
+                        searched_location=place_data.get('searched_location', ''),
+                        source_query=place_data.get('source_query', ''),
+                        recommendation_rank=rank
+                    )
+
+                except Exception as e:
+                    print(f"Error saving place {place_data.get('place_id', 'unknown')}: {e}")
+                    continue
+            
+            print(f"{'Created' if created else 'Updated'} daily recommendations for {user.email}")
+            print(f"Searched {len(locations_searched)} locations, generated {len(daily_recommendations)} top recommendations")
+            
+            return {
+                "results": daily_recommendations,
+                "user_profile": user_profile,
+                "custom_queries": list(set(all_custom_queries)),
+                "locations_searched": locations_searched,
+                "total_results": len(scored_places)
+            }
+            
+        except Exception as e:
+            print(f"Error generating daily recommendations for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
+
+    def add_location_to_search_history(self, user, location_key):
+        """Add a location to user's search history (max 10 recent locations)."""
+        try:
+            # Get current search history
+            history = user.search_history_locations if user.search_history_locations else []
+            
+            # Remove location if it already exists (to move it to front)
+            if location_key in history:
+                history.remove(location_key)
+            
+            # Add to front of list
+            history.insert(0, location_key)
+            
+            # Keep only last 10 searches
+            history = history[:10]
+            
+            # Update user
+            user.search_history_locations = history
+            user.save(update_fields=['search_history_locations'])
+            
+            print(f"Added {location_key} to search history for {user.email}")
+            
+        except Exception as e:
+            print(f"Error updating search history for {user.email}: {e}")
+
+    async def get_coordinates_from_zip(self, zip_code):
+        """Reuse existing geocoding method."""
+        places_api = PlacesAPIView()
+        return await places_api.get_coordinates_from_zip(zip_code)
+
+class BatchRecommendationProcessingAPIView(APIView):
+    """
+    Separate endpoint for Cloud Run Scheduler to batch process daily recommendations.
+    This is completely separate from the user-facing recommendation endpoint.
+    """
+    permission_classes = [AllowAny]  # Uses custom token authentication
+    parser_classes = [JSONParser]
+
+    def get(self, request):
+        """
+        Batch process recommendations for all users (Cloud Run Scheduler only).
+        Requires SCHEDULER_AUTH_TOKEN for authentication.
+        """
+        # Validate scheduler authentication
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        scheduler_token = os.getenv('SCHEDULER_AUTH_TOKEN', 'default-scheduler-token')
+        
+        if not auth_header.endswith(scheduler_token):
+            return Response({"error": "Unauthorized scheduler request"}, status=401)
+        
+        return self._batch_process_all_users()
+    
+    def _batch_process_all_users(self):
+        """
+        Batch process recommendations for all users (for Cloud Run Scheduler).
+        This endpoint processes all users and caches their recommendations.
+        """
+        start_time = time.time()
+        processed_users = 0
+        failed_users = 0
+        
+        try:
+            # Get all active users with children
+            users_with_children = User.objects.filter(
+                is_active=True,
+                children__isnull=False
+            ).distinct()
+            
+            print(f"Starting batch processing for {users_with_children.count()} users with children")
+            
+            for user in users_with_children:
+                try:
+                    # Generate daily aggregated recommendations for this user
+                    # Create a temporary instance to access the methods
+                    recommendation_api = RecommendedPlacesAPIView()
+                    recommendation_api.generate_and_cache_daily_recommendations(user)
+                    
+                    processed_users += 1
+                    print(f"✅ Processed daily recommendations for {user.email}")
+                    
+                except Exception as e:
+                    failed_users += 1
+                    print(f"❌ Failed to process {user.email}: {e}")
+                    continue
+            
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            
+            return Response({
+                "message": "Batch recommendation processing completed",
+                "processed_users": processed_users,
+                "failed_users": failed_users,
+                "total_users": users_with_children.count(),
+                "execution_time_ms": execution_time
+            }, status=HTTP_200_OK)
+            
+        except Exception as e:
+            print(f"Error in batch processing: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def post(self, request):
+        """
+        Get personalized recommendations for the authenticated user.
+        Returns cached results if available and fresh, otherwise generates new ones.
+        """
+        start_time = time.time()
+        
+        try:
+            user = request.user
+            print(f"Getting recommendations for user: {user.email}")
+            
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+
+            print(f"Children: {children}")
+            
+            # Get location data from request
+            data = request.data
+            zip_code = data.get("zip_code")
+            latitude = data.get("latitude", 40.712776)
+            longitude = data.get("longitude", -74.005974)
+            radius = data.get("radius", 500)
+            force_refresh = data.get("force_refresh", False)
+            
+            # Get coordinates from zip if provided
+            if zip_code:
+                latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
+                if not latitude or not longitude:
+                    return Response({"error": "Invalid ZIP code"}, status=HTTP_400_BAD_REQUEST)
+            
+            # Add this location to user's search history for future recommendations
+            location_key = zip_code or f"{latitude},{longitude}"
+            self.add_location_to_search_history(user, location_key)
+            
+            print(f"Zip code: {zip_code}")
+            print(f"Latitude: {latitude}")
+            print(f"Longitude: {longitude}")
+            print(f"Radius: {radius}")
+            print(f"Force refresh: {force_refresh}")
+            
+            # Check for today's cached recommendations first (unless force_refresh is True)
+            if not force_refresh:
+                cached_recommendation = self.get_cached_recommendations(user)
+                if cached_recommendation:
+                    execution_time = round((time.time() - start_time) * 1000, 2)
+                    print(f"✅ Returning today's cached recommendations for {user.email}")
+                    
+                    # Convert the related places back to the expected JSON format
+                    from .models import UserRecommendationPlace
+                    recommended_places = []
+                    recommendation_places = UserRecommendationPlace.objects.filter(
+                        user_recommendation=cached_recommendation
+                    ).select_related('place').order_by('recommendation_rank')
+                    
+                    for rec_place in recommendation_places:
+                        place = rec_place.place
+                        place_data = {
+                            "place_id": place.place_id,
+                            "title": place.title,
+                            "name": place.title,  # For compatibility
+                            "description": place.description,
+                            "rating": place.rating,
+                            "reviews": place.reviews,
+                            "formattedAddress": place.formatted_address,
+                            "vicinity": place.formatted_address,  # For compatibility
+                            "types": place.types,
+                            "imagePlaces": place.place_images,
+                            "category": place.category,
+                            "location": {
+                                "latitude": float(place.latitude) if place.latitude else None,
+                                "longitude": float(place.longitude) if place.longitude else None
+                            },
+                            "gps_coordinates": {
+                                "latitude": float(place.latitude) if place.latitude else None,
+                                "longitude": float(place.longitude) if place.longitude else None
+                            },
+                            # Recommendation-specific data
+                            "personalization_score": rec_place.personalization_score,
+                            "searched_location": rec_place.searched_location,
+                            "source_query": rec_place.source_query,
+                            "recommendation_rank": rec_place.recommendation_rank
+                        }
+                        recommended_places.append(place_data)
+                    
+                    return Response({
+                        "results": recommended_places,
+                        "custom_queries": cached_recommendation.custom_queries,
+                        "locations_searched": cached_recommendation.locations_searched,
+                        "total_results": cached_recommendation.total_results,
+                        "execution_time_ms": execution_time,
+                        "cached": True,
+                        "date_generated": cached_recommendation.date_generated.isoformat(),
+                        "cache_updated": cached_recommendation.updated_at.isoformat()
+                    }, status=HTTP_200_OK)
+            
+            # Generate fresh daily recommendations
+            recommendation_data = self.generate_and_cache_daily_recommendations(user)
+            
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            recommendation_data["execution_time_ms"] = execution_time
+            recommendation_data["cached"] = False
+            
+            return Response(recommendation_data, status=HTTP_200_OK)
+            
+        except Exception as e:
+            print(f"Error in recommendations: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({"error": str(e)}, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def build_user_profile(self, user, children):
+        """Build a comprehensive user profile for LLM context."""
+        profile = {
+            "user_name": user.name or "Parent",
+            "email": user.email,
+            "favorites": json.loads(user.favorites) if user.favorites else {},
+            "children": []
+        }
+        
+        for child in children:
+            child_data = {
+                "name": child.name,
+                "age": child.age,
+                "interests": child.interests or [],
+                "age_group": self.get_age_group(child.age)
+            }
+            profile["children"].append(child_data)
+        
+        # Add derived insights
+        profile["total_children"] = len(children)
+        profile["age_ranges"] = list(set([self.get_age_group(child.age) for child in children]))
+        profile["all_interests"] = list(set([interest for child in children for interest in (child.interests or [])]))
+        
+        return profile
+
+    def get_age_group(self, age):
+        """Categorize children by age group for better recommendations."""
+        if age <= 2:
+            return "toddler"
+        elif age <= 5:
+            return "preschooler"
+        elif age <= 8:
+            return "early_elementary"
+        elif age <= 12:
+            return "late_elementary"
+        else:
+            return "preteen"
+
+    def generate_llm_queries(self, user_profile, location):
+        """Use Gemini to generate personalized search queries based on user profile."""
+        try:
+            client = genai.Client(api_key=self.GEMINI_API_KEY)
+            
+            prompt = f"""
+            You are a family activity recommendation expert. Based on the user profile below, generate 5-7 specific search queries to use for Google Maps search to find the best family places and activities.
+
+            User Profile:
+            - Parent: {user_profile['user_name']}
+            - Number of children: {user_profile['total_children']}
+            - Children details: {json.dumps(user_profile['children'], indent=2)}
+            - Age groups represented: {', '.join(user_profile['age_ranges'])}
+            - Combined interests: {', '.join(user_profile['all_interests'])}
+
+            Guidelines:
+            1. Create queries that match the children's ages and interests
+            2. Consider safety and age-appropriateness
+            3. Include both indoor and outdoor options
+            4. Mix popular activities with unique local experiences
+            5. Each query should be 3-7 words
+            6. Focus on kid-friendly venues that welcome families
+
+            Return only a JSON array of search query strings, like:
+            ["family indoor play center", "toddler-friendly museums", "outdoor playgrounds"]
+            """
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+            #print(f"Gemini response: {response}")
+
+            # Parse Gemini response
+            llm_output = response.text.strip()
+            #print(f"Gemini raw output: {llm_output}")
+            
+            # Try to extract JSON array from response
+            try:
+                # Sometimes Gemini includes markdown formatting, so let's clean it
+                if "```json" in llm_output:
+                    llm_output = llm_output.split("```json")[1].split("```")[0].strip()
+                elif "```" in llm_output:
+                    llm_output = llm_output.split("```")[1].strip()
+                
+                custom_queries = json.loads(llm_output)
+                if isinstance(custom_queries, list):
+                    return custom_queries[:7]  # Limit to 7 queries
+            except json.JSONDecodeError:
+                print("Failed to parse Gemini JSON, using fallback")
+            
+        except Exception as e:
+            print(f"Gemini generation failed: {e}")
+        
+        # Fallback queries if LLM fails
+        return self.generate_fallback_queries(user_profile)
+
+    def generate_fallback_queries(self, user_profile):
+        """Generate fallback queries based on user profile without LLM."""
+        queries = []
+        interests = user_profile['all_interests']
+        age_groups = user_profile['age_ranges']
+        
+        # Base queries for different interests
+        interest_mapping = {
+            "Parks": "family parks playgrounds",
+            "Nature": "nature centers outdoor kids",
+            "Animals": "petting zoos aquariums kids",
+            "Creative": "kids art classes creative",
+            "Sports": "family sports activities kids",
+            "STEM": "science museums kids STEM",
+            "Food": "family restaurants kids menu",
+            "Play Centers": "indoor play centers kids",
+            "Playgrounds": "playgrounds family outdoor"
+        }
+        
+        # Add interest-based queries
+        for interest in interests[:4]:  # Limit to top 4 interests
+            if interest in interest_mapping:
+                queries.append(interest_mapping[interest])
+        
+        # Add age-appropriate queries
+        if "toddler" in age_groups:
+            queries.append("toddler friendly activities")
+        if "preschooler" in age_groups:
+            queries.append("preschool kids activities")
+        if any(age in age_groups for age in ["early_elementary", "late_elementary"]):
+            queries.append("elementary kids activities")
+        
+        return queries[:6] if queries else ["family activities kids", "playgrounds parks", "kids museums"]
+
+    async def get_recommended_places(self, custom_queries, latitude, longitude, radius):
+        """Use existing places search infrastructure with custom queries."""
+        all_places = []
+        
+        print(f"Getting recommended places for {custom_queries} with radius {radius} at {latitude},{longitude}")
+
+        # TODO: split queries into groups using 'OR' and search each group separately
+
+        # Convert custom queries into the format expected by existing search
+            
+        search_params = {
+            "location": f"{latitude},{longitude}",
+            "radius": radius,
+            "key": PlacesAPIView.API_KEY
+        }
+
+        curr_query = ' OR '.join(custom_queries[:2])
+            
+        try:
+            places_api = PlacesAPIView()
+            async with aiohttp.ClientSession() as session:
+                results = await places_api.async_fetch_all_places(search_params, session, max_results=15, queries=[curr_query])
+                
+            # Process images for each place using the existing pipeline
+            if results:
+                print(f"Processing images for {len(results)} places from recommendations...")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_place = {
+                        executor.submit(process_images_for_place, place): place
+                        for place in results
+                    }
+                    
+                    for future in as_completed(future_to_place):
+                        place = future_to_place[future]
+                        try:
+                            processed_urls = future.result()
+                            if processed_urls:
+                                place["imagePlaces"] = processed_urls
+                                print(f"Processed {len(processed_urls)} images for place {place.get('place_id', 'unknown')}")
+                            else:
+                                place["imagePlaces"] = []
+                        except Exception as e:
+                            print(f"Error processing images for place {place.get('place_id', 'unknown')}: {e}")
+                            place["imagePlaces"] = []
+                
+            for place in results:
+                place["source_query"] = curr_query
+                all_places.append(place)
+
+        except Exception as e:
+            print(f"Error searching with query '{curr_query}': {e}")
+        
+        # Remove duplicates based on place_id
+        unique_places = []
+        seen_ids = set()
+        for place in all_places:
+            place_id = place.get("place_id")
+            if place_id and place_id not in seen_ids:
+                seen_ids.add(place_id)
+                unique_places.append(place)
+        
+        return unique_places
+
+    def score_places_for_user(self, places, user_profile):
+        """Add personalization scores based on how well places match user profile."""
+        for place in places:
+            score = 0
+            
+            # Score based on children's interests
+            place_text = f"{place.get('title', '')} {place.get('description', '')} {place.get('category', '')}".lower()
+            
+            for interest in user_profile['all_interests']:
+                if interest.lower() in place_text:
+                    score += 10
+            
+            # Score based on age appropriateness
+            age_keywords = {
+                "toddler": ["toddler", "baby", "infant", "crawl"],
+                "preschooler": ["preschool", "4 year", "5 year"],
+                "early_elementary": ["elementary", "school age"],
+                "late_elementary": ["kids", "children", "youth"]
+            }
+            
+            for age_group in user_profile['age_ranges']:
+                if age_group in age_keywords:
+                    for keyword in age_keywords[age_group]:
+                        if keyword in place_text:
+                            score += 5
+            
+            # Boost score for highly rated places
+            rating = place.get('rating', 0)
+            if rating >= 4.5:
+                score += 15
+            elif rating >= 4.0:
+                score += 10
+            elif rating >= 3.5:
+                score += 5
+            
+            # Boost score for places with reviews (more established)
+            review_count = place.get('reviews', 0) or place.get('userRatingCount', 0)
+            if review_count > 100:
+                score += 10
+            elif review_count > 50:
+                score += 5
+            
+            place["personalization_score"] = score
+            
+        return places
+
+    def get_user_locations(self, user):
+        """Get up to 5 locations for recommendations (preferences first, then search history)."""
+        all_locations = []
+        
+        # First, add location preferences (priority)
+        if user.location_preferences:
+            all_locations.extend(user.location_preferences)
+        
+        # Then add search history locations
+        if user.search_history_locations:
+            for location in user.search_history_locations:
+                if location not in all_locations:  # Avoid duplicates
+                    all_locations.append(location)
+        
+        # Limit to 5 total locations
+        locations_to_use = all_locations[:5]
+        
+        # If user has no locations, use defaults
+        if not locations_to_use:
+            locations_to_use = ["90210", "10001", "94102"]  # Default cities
+        
+        # Convert to the expected format with coordinates
+        location_data = {}
+        default_coords = {
+            "90210": {"latitude": 34.0901, "longitude": -118.4065},  # Beverly Hills
+            "10001": {"latitude": 40.7505, "longitude": -73.9934},  # NYC
+            "94102": {"latitude": 37.7849, "longitude": -122.4094}, # San Francisco
+            "02101": {"latitude": 42.3601, "longitude": -71.0589}, # Boston
+            "30309": {"latitude": 33.7490, "longitude": -84.3880}, # Atlanta
+        }
+        
+        for location in locations_to_use:
+            if location in default_coords:
+                location_data[location] = default_coords[location]
+            else:
+                # For unknown zip codes, try to geocode them
+                try:
+                    lat, lng = asyncio.run(self.get_coordinates_from_zip(location))
+                    if lat and lng:
+                        location_data[location] = {"latitude": lat, "longitude": lng}
+                except Exception as e:
+                    print(f"Error geocoding {location}: {e}")
+                    continue
+        
+        print(f"Using {len(location_data)} locations for {user.email}: {list(location_data.keys())}")
+        return location_data
+
+    def get_cached_recommendations(self, user):
+        """Get today's cached recommendations if they exist and are fresh."""
+        try:
+            today = datetime.now().date()
+            
+            cached = UserRecommendation.objects.filter(
+                user=user,
+                date_generated=today
+            ).first()
+            
+            if cached:
+                # Verify the user profile hasn't changed by comparing hash
+                children = Child.objects.filter(user=user)
+                current_profile = self.build_user_profile(user, children)
+                current_hash = self.get_profile_hash(current_profile)
+                
+                if cached.user_profile_hash == current_hash:
+                    return cached
+                else:
+                    print(f"User profile changed for {user.email}, invalidating today's cache")
+                    cached.delete()
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error checking cache for {user.email}: {e}")
+            return None
+
+    def get_profile_hash(self, user_profile):
+        """Generate a hash of the user profile for cache invalidation."""
+        # Create a stable string representation of the profile
+        profile_string = json.dumps(user_profile, sort_keys=True)
+        return hashlib.md5(profile_string.encode()).hexdigest()
+
+    def generate_and_cache_daily_recommendations(self, user):
+        """Generate daily aggregated recommendations from user's preferred and search history locations."""
+        try:
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+            
+            # Build user profile for LLM
+            user_profile = self.build_user_profile(user, children)
+            print(f"User profile for {user.email}: {user_profile}")
+            
+            # Get locations to search (preferences + history, max 5)
+            locations_to_process = self.get_user_locations(user)
+            
+            all_places = []
+            all_custom_queries = []
+            locations_searched = list(locations_to_process.keys())
+            
+            print(f"Locations to process: {locations_to_process}")
+            #input("Press Enter to continue...")
+
+            # Search across all user's locations
+            for location_key, location_data in locations_to_process.items():
+                try:
+                    latitude = location_data['latitude']
+                    longitude = location_data['longitude']
+                    
+                    # Generate custom search queries using LLM for this location
+                    location_queries = self.generate_llm_queries(user_profile, location_key)
+                    print(f"Location queries: {location_queries}")
+                    #input("Press Enter to continue...")
+                    all_custom_queries.extend(location_queries)
+                    
+                    # Get places for this location
+                    recommended_places = asyncio.run(self.get_recommended_places(
+                        location_queries, latitude, longitude, 20000
+                    ))
+                    
+                    # Add location info to each place
+                    for place in recommended_places:
+                        place['searched_location'] = location_key
+                    
+                    all_places.extend(recommended_places)
+                    print(f"Found {len(recommended_places)} places for {location_key}")
+                    
+                except Exception as e:
+                    print(f"Error searching location {location_key} for {user.email}: {e}")
+                    continue
+            
+            # Remove duplicates based on place_id
+            unique_places = []
+            seen_ids = set()
+            for place in all_places:
+                place_id = place.get("place_id")
+                if place_id and place_id not in seen_ids:
+                    seen_ids.add(place_id)
+                    unique_places.append(place)
+
+            print(f"Unique places: {len(unique_places)}")
+            #input("Press Enter to continue...")
+            
+            # Add personalization scores
+            scored_places = self.score_places_for_user(unique_places, user_profile)
+            
+            # Sort by personalization score
+            scored_places.sort(key=lambda x: x.get("personalization_score", 0), reverse=True)
+            
+            # Limit to top 15 for daily recommendations
+            daily_recommendations = scored_places[:15]
+            
+            # Cache the results for today
+            today = datetime.now().date()
+            profile_hash = self.get_profile_hash(user_profile)
+            
+            print(f"Updating or creating today's recommendation for {user.email}")
+            #input("Press Enter to continue...")
+            
+            # Update or create today's recommendation
+            cached_recommendation, created = UserRecommendation.objects.update_or_create(
+                user=user,
+                date_generated=today,
+                defaults={
+                    'user_profile_hash': profile_hash,
+                    'custom_queries': list(set(all_custom_queries)),  # Remove duplicates
+                    'locations_searched': locations_searched,
+                    'total_results': len(scored_places)
+                }
+            )
+            
+            # Clear existing places for this recommendation (in case of update)
+            if not created:
+                cached_recommendation.recommended_places.clear()
+            
+            # Create Place objects and UserRecommendationPlace relationships
+            from .models import UserRecommendationPlace
+            for rank, place_data in enumerate(daily_recommendations, 1):
+                try:
+                    # Get or create the Place object
+                    place, place_created = Place.objects.get_or_create(
+                        place_id=place_data.get('place_id'),
+                        defaults={
+                            'title': place_data.get('title', place_data.get('name', '')),
+                            'description': place_data.get('description', ''),
+                            'latitude': place_data.get('location', {}).get('latitude') or place_data.get('gps_coordinates', {}).get('latitude'),
+                            'longitude': place_data.get('location', {}).get('longitude') or place_data.get('gps_coordinates', {}).get('longitude'),
+                            'rating': place_data.get('rating'),
+                            'reviews': place_data.get('reviews') or place_data.get('userRatingCount'),
+                            'formatted_address': place_data.get('formattedAddress', place_data.get('vicinity', '')),
+                            'types': place_data.get('types', []),
+                            'place_images': place_data.get('imagePlaces', []),
+                            'category': place_data.get('category', ''),
+                        }
+                    )
+                    
+                    # Create the recommendation relationship
+                    UserRecommendationPlace.objects.create(
+                        user_recommendation=cached_recommendation,
+                        place=place,
+                        personalization_score=place_data.get('personalization_score', 0),
+                        searched_location=place_data.get('searched_location', ''),
+                        source_query=place_data.get('source_query', ''),
+                        recommendation_rank=rank
+                    )
+                    
+                except Exception as e:
+                    print(f"Error saving place {place_data.get('place_id', 'unknown')}: {e}")
+                    continue
+            
+            print(f"{'Created' if created else 'Updated'} daily recommendations for {user.email}")
+            print(f"Searched {len(locations_searched)} locations, generated {len(daily_recommendations)} top recommendations")
+            
+            return {
+                "results": daily_recommendations,
+                "user_profile": user_profile,
+                "custom_queries": list(set(all_custom_queries)),
+                "locations_searched": locations_searched,
+                "total_results": len(scored_places)
+            }
+            
+        except Exception as e:
+            print(f"Error generating daily recommendations for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
+
+    def add_location_to_search_history(self, user, location_key):
+        """Add a location to user's search history (max 10 recent locations)."""
+        try:
+            # Get current search history
+            history = user.search_history_locations if user.search_history_locations else []
+            
+            # Remove location if it already exists (to move it to front)
+            if location_key in history:
+                history.remove(location_key)
+            
+            # Add to front of list
+            history.insert(0, location_key)
+            
+            # Keep only last 10 searches
+            history = history[:10]
+            
+            # Update user
+            user.search_history_locations = history
+            user.save(update_fields=['search_history_locations'])
+            
+            print(f"Added {location_key} to search history for {user.email}")
+            
+        except Exception as e:
+            print(f"Error updating search history for {user.email}: {e}")
+
+    async def get_coordinates_from_zip(self, zip_code):
+        """Reuse existing geocoding method."""
+        places_api = PlacesAPIView()
+        return await places_api.get_coordinates_from_zip(zip_code)
+
+
+class RecommendedEventsAPIView(APIView):
+    """
+    Personalized event recommendations endpoint for authenticated users.
+    
+    - GET: Retrieve user's latest recommended events (for frontend display)
+    - POST: Generate/refresh personalized event recommendations for a user
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+    def get(self, request):
+        """Get the latest recommended events for the authenticated user."""
+        start_time = time.time()
+        user = request.user
+        
+        print(f"🎯 GET /api/events/recommended/ - User: {user.email} (ID: {user.id})")
+        print(f"📊 Request headers: {dict(request.headers)}")
+        
+        try:
+            print(f"🔍 Fetching latest event recommendations for user: {user.email}")
+            recommendations = self._get_user_latest_event_recommendations(user)
+            
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            print(f"✅ GET Success - Found {len(recommendations)} cached event recommendations")
+            print(f"⏱️ GET Execution time: {execution_time}ms")
+            
+            return Response({
+                "results": recommendations,
+                "status": "success",
+                "execution_time_ms": execution_time,
+                "total_results": len(recommendations)
+            }, status=HTTP_200_OK)
+            
+        except Exception as e:
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            print(f"❌ GET Error for user {user.email}: {e}")
+            print(f"⏱️ GET Failed execution time: {execution_time}ms")
+            import traceback
+            traceback.print_exc()
+            
+            return Response({
+                "error": "Failed to get event recommendations",
+                "status": "error",
+                "execution_time_ms": execution_time
+            }, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def post(self, request):
+        """
+        Generate personalized event recommendations for the authenticated user.
+        Returns cached results if available and fresh, otherwise generates new ones.
+        """
+        start_time = time.time()
+        user = request.user
+        
+        print(f"🚀 POST /api/events/recommended/ - User: {user.email} (ID: {user.id})")
+        print(f"📊 Request data keys: {list(request.data.keys())}")
+        print(f"📊 Request headers: {dict(request.headers)}")
+        
+        try:
+            print(f"🔍 Starting event recommendation generation for user: {user.email}")
+            
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+            print(f"👶 User has {children.count()} children: {[f'{child.name} (age {child.age})' for child in children]}")
+            
+            # Get location data from request
+            data = request.data
+            zip_code = data.get("zip_code")
+            
+            #latitude = data.get("latitude", 40.712776)
+            #longitude = data.get("longitude", -74.005974)
+            radius = data.get("radius", 20000)  # miles for events
+            
+            event_types = data.get("event_types", ["kid-friendly", "family-friendly"])
+            date_range = data.get("date_range", "this_week")
+            force_refresh = data.get("force_refresh", True)
+            is_homebase = data.get("is_homebase", False)  # Flag to indicate this is a homebase update
+            
+            print(f"📍 Location parameters:")
+            print(f"   Zip code: {zip_code}")
+            print(f"   Radius: {radius} miles")
+            print(f"🎪 Event parameters:")
+            print(f"   Event types: {event_types}")
+            print(f"   Date range: {date_range}")
+            print(f"   Force refresh: {force_refresh}")
+            
+            #input("Press Enter to continue...")
+
+            # Get coordinates from zip if provided
+            if zip_code:
+                print(f"🗺️ Geocoding ZIP code: {zip_code}")
+                geocode_start = time.time()
+                latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
+                geocode_time = round((time.time() - geocode_start) * 1000, 2)
+                print(f"🗺️ Geocoding completed in {geocode_time}ms: {latitude}, {longitude}")
+                
+                if not latitude or not longitude:
+                    print(f"❌ Invalid ZIP code: {zip_code}")
+                    return Response({"error": "Invalid ZIP code"}, status=HTTP_400_BAD_REQUEST)
+            
+            # Update user's homebase if this is a homebase update
+            if is_homebase and zip_code:
+                try:
+                    user.homebaseZipCode = zip_code
+                    user.save()
+                    print(f"✅ Updated homebase for {user.email} to {zip_code}")
+                except Exception as e:
+                    print(f"⚠️ Failed to update homebase for {user.email}: {e}")
+                    # Don't fail the entire request if homebase update fails
+            
+            # Add this location to user's search history for future recommendations
+            location_key = zip_code or f"{latitude},{longitude}"
+            print(f"📝 Adding location to search history: {location_key}")
+            self.add_location_to_search_history(user, location_key)
+            
+            # Check for today's cached event recommendations first (unless force_refresh is True)
+            if not force_refresh:
+                print(f"🔍 Checking for cached event recommendations...")
+                cache_check_start = time.time()
+                cached_recommendation = self.get_cached_event_recommendations(user)
+                cache_check_time = round((time.time() - cache_check_start) * 1000, 2)
+                
+                if cached_recommendation:
+                    print(f"✅ Found cached event recommendations from {cached_recommendation.created_at}")
+                    print(f"🔍 Cache check completed in {cache_check_time}ms")
+                    
+                    # Convert the related events back to the expected JSON format
+                    conversion_start = time.time()
+                    recommended_events = []
+                    recommendation_events = UserRecommendationEvent.objects.filter(
+                        user_recommendation=cached_recommendation
+                    ).select_related('event').order_by('recommendation_rank')
+                    
+                    print(f"📊 Converting {recommendation_events.count()} cached events to response format")
+                    
+                    for rec_event in recommendation_events:
+                        event = rec_event.event
+                        event_data = {
+                            "id": event.event_id,
+                            "title": event.title,
+                            "description": event.description,
+                            "start_date": event.start_date,
+                            "when": event.when,
+                            "address": event.address,
+                            "formatted_address": event.formatted_address,
+                            "event_latitude": float(event.latitude) if event.latitude else None,
+                            "event_longitude": float(event.longitude) if event.longitude else None,
+                            "venue_name": event.venue_name,
+                            "venue_rating": event.venue_rating,
+                            "venue_reviews": event.venue_reviews,
+                            "link": event.link,
+                            "thumbnail": event.thumbnail,
+                            "image": event.image,
+                            "event_type": event.event_type,
+                            "has_tickets": event.has_tickets,
+                            "ticket_info": event.ticket_info,
+                            "ticket_sources": event.ticket_sources,
+                            "source": event.source,
+                            # Recommendation-specific data
+                            "personalization_score": rec_event.personalization_score,
+                            "recommendation_rank": rec_event.recommendation_rank
+                        }
+                        recommended_events.append(event_data)
+                    
+                    conversion_time = round((time.time() - conversion_start) * 1000, 2)
+                    execution_time = round((time.time() - start_time) * 1000, 2)
+                    
+                    print(f"📊 Event conversion completed in {conversion_time}ms")
+                    print(f"✅ POST Success (CACHED) - Returning {len(recommended_events)} cached event recommendations")
+                    print(f"⏱️ Total POST execution time: {execution_time}ms")
+                    
+                    return Response({
+                        "results": recommended_events,
+                        "custom_queries": cached_recommendation.custom_queries,
+                        "locations_searched": cached_recommendation.locations_searched,
+                        "total_results": cached_recommendation.total_results,
+                        "execution_time_ms": execution_time,
+                        "cached": True,
+                        "date_generated": cached_recommendation.created_at.isoformat()
+                    }, status=HTTP_200_OK)
+                else:
+                    print(f"❌ No cached event recommendations found")
+                    print(f"🔍 Cache check completed in {cache_check_time}ms")
+            
+            # Generate fresh event recommendations
+            print(f"🔄 Generating fresh event recommendations...")
+            generation_start = time.time()
+            
+            recommendation_data = self.generate_and_cache_event_recommendations(
+                user, latitude, longitude, radius, event_types, date_range
+            )
+            
+            generation_time = round((time.time() - generation_start) * 1000, 2)
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            
+            print(f"🔄 Event generation completed in {generation_time}ms")
+            print(f"✅ POST Success (FRESH) - Generated {len(recommendation_data.get('results', []))} new event recommendations")
+            print(f"⏱️ Total POST execution time: {execution_time}ms")
+
+            #input("Press Enter to continue...")
+            
+            recommendation_data["execution_time_ms"] = execution_time
+            recommendation_data["cached"] = False
+            
+            return Response(recommendation_data, status=HTTP_200_OK)
+            
+        except Exception as e:
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            print(f"❌ POST Error for user {user.email}: {e}")
+            print(f"⏱️ POST Failed execution time: {execution_time}ms")
+            import traceback
+            traceback.print_exc()
+            return Response({
+                "error": str(e),
+                "execution_time_ms": execution_time
+            }, status=HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _get_user_latest_event_recommendations(self, user):
+        """Get the latest event recommendations for a user from cache/database."""
+        try:
+            print(f"🔍 _get_user_latest_event_recommendations for user: {user.email}")
+            
+            # Get the latest recommendation entry for this user
+            latest_recommendation = UserEventRecommendation.objects.filter(
+                user=user
+            ).order_by('-created_at').first()
+            
+            if not latest_recommendation:
+                print(f"❌ No event recommendations found for user: {user.email}")
+                return []
+            
+            print(f"✅ Found latest event recommendation from: {latest_recommendation.created_at}")
+            print(f"📊 Recommendation metadata: {latest_recommendation.total_results} total results, {len(latest_recommendation.custom_queries)} queries")
+            
+            # Get the recommended events for this recommendation
+            recommended_events = UserRecommendationEvent.objects.filter(
+                user_recommendation=latest_recommendation
+            ).order_by('recommendation_rank')
+            
+            print(f"📊 Converting {recommended_events.count()} recommendation events to response format")
+            
+            # Convert to list of event dictionaries
+            events_list = []
+            for rec_event in recommended_events:
+                event_data = {
+                    "id": rec_event.event.event_id,
+                    "title": rec_event.event.title,
+                    "description": rec_event.event.description,
+                    "start_date": rec_event.event.start_date,
+                    "when": rec_event.event.when,
+                    "address": rec_event.event.address,
+                    "formatted_address": rec_event.event.formatted_address,
+                    "event_latitude": float(rec_event.event.latitude) if rec_event.event.latitude else None,
+                    "event_longitude": float(rec_event.event.longitude) if rec_event.event.longitude else None,
+                    "venue_name": rec_event.event.venue_name,
+                    "venue_rating": rec_event.event.venue_rating,
+                    "venue_reviews": rec_event.event.venue_reviews,
+                    "link": rec_event.event.link,
+                    "thumbnail": rec_event.event.thumbnail,
+                    "image": rec_event.event.image,
+                    "event_type": rec_event.event.event_type,
+                    "has_tickets": rec_event.event.has_tickets,
+                    "ticket_info": rec_event.event.ticket_info,
+                    "ticket_sources": rec_event.event.ticket_sources,
+                    "personalization_score": rec_event.personalization_score,
+                    "recommendation_rank": rec_event.recommendation_rank,
+                    "source": rec_event.event.source
+                }
+                events_list.append(event_data)
+            
+            print(f"✅ Successfully converted {len(events_list)} events for user: {user.email}")
+            return events_list
+            
+        except Exception as e:
+            print(f"❌ Error retrieving latest event recommendations for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def build_user_profile_for_events(self, user, children):
+        """Build a comprehensive user profile for event LLM context."""
+        profile = {
+            "user_name": user.name or "Parent",
+            "email": user.email,
+            "favorites": json.loads(user.favorites) if user.favorites else {},
+            "children": []
+        }
+        
+        for child in children:
+            child_data = {
+                "name": child.name,
+                "age": child.age,
+                "interests": child.interests or [],
+                "age_group": self.get_age_group_for_events(child.age)
+            }
+            profile["children"].append(child_data)
+        
+        # Add derived insights
+        profile["total_children"] = len(children)
+        profile["age_ranges"] = list(set([self.get_age_group_for_events(child.age) for child in children]))
+        profile["all_interests"] = list(set([interest for child in children for interest in (child.interests or [])]))
+        
+        return profile
+
+    def get_age_group_for_events(self, age):
+        """Categorize children by age group for better event recommendations."""
+        if age <= 2:
+            return "toddler"
+        elif age <= 5:
+            return "preschooler"
+        elif age <= 8:
+            return "early_elementary"
+        elif age <= 12:
+            return "late_elementary"
+        else:
+            return "preteen"
+
+    def generate_event_llm_queries(self, user_profile, location):
+        """Use Gemini to generate personalized event search queries based on user profile."""
+        try:
+            client = genai.Client(api_key=self.GEMINI_API_KEY)
+            
+            prompt = f"""
+            You are a family event recommendation expert. Based on the user profile below, generate 4-6 specific search queries to find the best family events and activities.
+
+            User Profile:
+            - Parent: {user_profile['user_name']}
+            - Number of children: {user_profile['total_children']}
+            - Children details: {json.dumps(user_profile['children'], indent=2)}
+            - Age groups represented: {', '.join(user_profile['age_ranges'])}
+            - Combined interests: {', '.join(user_profile['all_interests'])}
+
+            Guidelines:
+            1. Create event-specific queries that match the children's ages and interests
+            2. Focus on family events, workshops, classes, and activities
+            3. Consider seasonal and educational events
+            4. Include both indoor and outdoor event options
+            5. Each query should be 3-6 words
+            6. Focus on events that welcome families and children
+
+            Examples of good queries:
+            - "kids art workshops"
+            - "family science events"
+            - "children music classes"
+            - "outdoor family activities"
+
+            Return only a JSON array of search query strings, like:
+            ["kids art workshops", "family science events", "children outdoor activities"]
+            """
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+            # Parse Gemini response
+            llm_output = response.text.strip()
+            
+            # Try to extract JSON array from response
+            try:
+                # Sometimes Gemini includes markdown formatting, so let's clean it
+                if "```json" in llm_output:
+                    llm_output = llm_output.split("```json")[1].split("```")[0].strip()
+                elif "```" in llm_output:
+                    llm_output = llm_output.split("```")[1].strip()
+                
+                custom_queries = json.loads(llm_output)
+                if isinstance(custom_queries, list):
+                    return custom_queries[:6]  # Limit to 6 queries
+            except json.JSONDecodeError:
+                print("Failed to parse Gemini JSON for events, using fallback")
+            
+        except Exception as e:
+            print(f"Gemini event generation failed: {e}")
+        
+        # Fallback queries if LLM fails
+        return self.generate_fallback_event_queries(user_profile)
+
+    def generate_fallback_event_queries(self, user_profile):
+        """Generate fallback event queries based on user profile without LLM."""
+        queries = []
+        interests = user_profile['all_interests']
+        age_groups = user_profile['age_ranges']
+        
+        # Base queries for different interests
+        interest_mapping = {
+            "Arts": "kids art workshops",
+            "Music": "children music classes",
+            "Sports": "family sports events",
+            "STEM": "science events kids",
+            "Animals": "petting zoo events",
+            "Nature": "outdoor family activities",
+            "Creative": "craft workshops kids",
+            "Food": "cooking classes children"
+        }
+        
+        # Add interest-based queries
+        for interest in interests[:3]:  # Limit to top 3 interests
+            if interest in interest_mapping:
+                queries.append(interest_mapping[interest])
+        
+        # Add age-appropriate queries
+        if "toddler" in age_groups or "preschooler" in age_groups:
+            queries.append("toddler events activities")
+        if any(age in age_groups for age in ["early_elementary", "late_elementary"]):
+            queries.append("kids educational events")
+        
+        # Add general family queries if we don't have enough
+        if len(queries) < 3:
+            queries.extend(["family events kids", "children workshops", "kids activities"])
+        
+        return queries[:5] if queries else ["family events", "kids activities", "children workshops"]
+
+    async def get_recommended_events(self, custom_queries, latitude, longitude, radius, date_range):
+        """Use existing events search infrastructure with custom queries."""
+        all_events = []
+        
+        print(f"Getting recommended events for {custom_queries} with radius {radius} miles at {latitude},{longitude}")
+
+        try:
+            # Use EventsAPIView logic for searching events
+            events_api = EventsAPIView()
+            
+            # Convert radius from miles to meters for consistency (though events use miles)
+            search_radius = radius
+            
+            for query in custom_queries:
+                try:
+                    # Build search parameters similar to EventsAPIView
+                    city_and_state = events_api.get_city_from_coordinates(latitude, longitude)
+                    
+                    # Use the async_search_events method from EventsAPIView
+                    event_results = await events_api.async_search_events(
+                        city_and_state, 
+                        [query],  # event_types as list
+                        date_range, 
+                        1  # page
+                    )
+                    
+                    # Add source query to each event and filter by distance
+                    for event in event_results:
+                        event["source_query"] = query
+                        
+                        # Extract coordinates from event address if not already present
+                        event_lat = event.get("event_latitude")
+                        event_lon = event.get("event_longitude")
+                        
+                        # If coordinates are missing, try to extract from address
+                        if not event_lat or not event_lon:
+                            print(f"🗺️ Extracting coordinates for event: {event.get('title', 'Unknown')}")
+                            event_lat, event_lon = self.extract_coordinates_from_address(event.get("address", []))
+                            if event_lat and event_lon:
+                                event["event_latitude"] = event_lat
+                                event["event_longitude"] = event_lon
+                                print(f"✅ Extracted coordinates: {event_lat}, {event_lon}")
+                            else:
+                                print(f"❌ Could not extract coordinates for event")
+
+                        print(f"📍 Event: {event.get('title', 'Unknown')} at {event_lat}, {event_lon}")
+
+                        if event_lat and event_lon:
+                            # Calculate distance from search location using our own method
+                            distance = self.calculate_distance(latitude, longitude, event_lat, event_lon)
+                            print(f"📏 Distance: {distance} miles (radius limit: {radius} miles)")
+                            
+                            if distance and distance <= radius:
+                                event["distance"] = distance
+                                all_events.append(event)
+                                print(f"✅ Event within radius - added to results")
+                            else:
+                                print(f"❌ Event outside radius - excluded")
+                        else:
+                            # If we can't get coordinates, include the event but mark distance as unknown
+                            event["distance"] = None
+                            event["event_latitude"] = None
+                            event["event_longitude"] = None
+                            all_events.append(event)
+                            print(f"⚠️ Event added without distance verification (no coordinates)")
+                    
+                    #input("Press Enter to continue...")
+                    print(f"🔍 Found {len(event_results)} events for query: {query}")
+                    print(f"✅ Added {len([e for e in event_results if e.get('distance') is not None and e.get('distance') <= radius])} events within radius")
+                    
+                except Exception as e:
+                    print(f"Error searching events with query '{query}': {e}")
+                    continue
+        
+        except Exception as e:
+            print(f"Error in get_recommended_events: {e}")
+        
+        # Remove duplicates based on event ID
+        unique_events = []
+        seen_ids = set()
+        for event in all_events:
+            event_id = event.get("id")
+            if event_id and event_id not in seen_ids:
+                seen_ids.add(event_id)
+                unique_events.append(event)
+        
+        print(f"Returning {len(unique_events)} unique recommended events")
+        return unique_events
+
+    def score_events_for_user(self, events, user_profile):
+        """Use Gemini AI to intelligently score events based on kid-friendliness, family-friendliness, and user profile matching."""
+        print(f"🤖 Starting AI-powered event scoring for {len(events)} events")
+        
+        # If no events, return early
+        if not events:
+            return events
+            
+        try:
+            client = genai.Client(api_key=self.GEMINI_API_KEY)
+            
+            # Process events in batches to avoid token limits
+            batch_size = 20
+            scored_events = []
+            
+            for i in range(0, len(events), batch_size):
+                batch = events[i:i + batch_size]
+                
+                # Create event summaries for Gemini analysis
+                event_summaries = []
+                for idx, event in enumerate(batch):
+                    event_summary = {
+                        "index": idx,
+                        "id": event.get('id', 'unknown'),
+                        "title": event.get('title', ''),
+                        "description": event.get('description', ''),
+                        "event_type": event.get('event_type', ''),
+                        "venue_name": event.get('venue_name', ''),
+                        "venue_rating": event.get('venue_rating', 0),
+                        "venue_reviews": event.get('venue_reviews', 0),
+                        "address": event.get('formatted_address', ''),
+                        "when": event.get('when', ''),
+                        "has_tickets": event.get('has_tickets', False),
+                        "ticket_info": event.get('ticket_info', [])
+                    }
+                    event_summaries.append(event_summary)
+                
+                prompt = f"""
+                You are an expert in family and child-friendly event evaluation. Analyze each event and score them based on how well they match this family's profile and their kid/family-friendliness.
+
+                FAMILY PROFILE:
+                - Parent: {user_profile['user_name']}
+                - Number of children: {user_profile['total_children']}
+                - Children details: {json.dumps(user_profile['children'], indent=2)}
+                - Age groups: {', '.join(user_profile['age_ranges'])}
+                - Combined interests: {', '.join(user_profile['all_interests'])}
+                - User favorites: {json.dumps(user_profile.get('favorites', {}), indent=2)}
+
+                EVENTS TO ANALYZE:
+                {json.dumps(event_summaries, indent=2)}
+
+                SCORING CRITERIA (Total: 100 points):
+                1. **Kid-Friendliness (30 points)**: How suitable is this event for children? Consider safety, age-appropriateness, engagement level, and whether children are welcomed/encouraged.
+
+                2. **Family-Friendliness (25 points)**: How well does this accommodate families? Consider parent supervision, family activities, stroller access, facilities, etc.
+
+                3. **Profile Match (25 points)**: How well does this event match the children's ages, interests, and family preferences?
+
+                4. **Quality & Reliability (20 points)**: Venue rating, reviews, event organization, ticketing reliability, etc.
+
+                SPECIAL CONSIDERATIONS:
+                - Age appropriateness is crucial - events should match the children's developmental stages
+                - Educational value adds bonus points
+                - Safety and supervision considerations for different age groups
+                - Accessibility for families (parking, strollers, etc.)
+                - Weather considerations for outdoor events
+                - Time appropriateness (not too late for young children)
+
+                Return ONLY a JSON array with scores for each event in the same order:
+                [
+                    {{
+                        "index": 0,
+                        "score": 85,
+                        "reasoning": "High kid-friendliness with hands-on activities perfect for ages 4-8, excellent venue rating, matches STEM interests"
+                    }},
+                    {{
+                        "index": 1,
+                        "score": 45,
+                        "reasoning": "Limited kid appeal, more adult-focused, but family-friendly venue"
+                    }},
+                    ...
+                ]
+                """
+
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                    )
+
+                    # Parse Gemini response
+                    llm_output = response.text.strip()
+                    
+                    # Clean up JSON formatting
+                    if "```json" in llm_output:
+                        llm_output = llm_output.split("```json")[1].split("```")[0].strip()
+                    elif "```" in llm_output:
+                        llm_output = llm_output.split("```")[1].strip()
+                    
+                    scores = json.loads(llm_output)
+                    
+                    # Apply scores to events in this batch
+                    for score_data in scores:
+                        if isinstance(score_data, dict) and 'index' in score_data and 'score' in score_data:
+                            event_idx = score_data['index']
+                            if 0 <= event_idx < len(batch):
+                                ai_score = max(0, min(100, score_data['score']))  # Clamp between 0-100
+                                reasoning = score_data.get('reasoning', 'AI analysis')
+                                
+                                batch[event_idx]["personalization_score"] = ai_score
+                                batch[event_idx]["ai_reasoning"] = reasoning
+                                
+                                print(f"🎯 Event '{batch[event_idx].get('title', 'Unknown')}' scored {ai_score}/100")
+                                print(f"   Reasoning: {reasoning}")
+                    
+                    scored_events.extend(batch)
+                    print(f"✅ Processed batch {i//batch_size + 1}/{(len(events) + batch_size - 1)//batch_size}")
+                    
+                except json.JSONDecodeError as e:
+                    print(f"❌ Failed to parse Gemini response for batch {i//batch_size + 1}: {e}")
+                    print(f"Raw response: {llm_output[:200]}...")
+                    # Fallback to rule-based scoring for this batch
+                    scored_events.extend(self._fallback_score_events(batch, user_profile))
+                    
+                except Exception as e:
+                    print(f"❌ Gemini API error for batch {i//batch_size + 1}: {e}")
+                    # Fallback to rule-based scoring for this batch
+                    scored_events.extend(self._fallback_score_events(batch, user_profile))
+                
+                # Small delay between batches to respect rate limits
+                if i + batch_size < len(events):
+                    time.sleep(0.5)
+            
+            print(f"🎉 AI event scoring completed for {len(scored_events)} events")
+            return scored_events
+            
+        except Exception as e:
+            print(f"❌ Critical error in AI event scoring: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to rule-based scoring for all events
+            return self._fallback_score_events(events, user_profile)
+
+    def _fallback_score_events(self, events, user_profile):
+        """Fallback rule-based scoring when AI fails."""
+        print(f"⚠️ Using fallback rule-based scoring for {len(events)} events")
+        
+        for event in events:
+            score = 0
+            
+            # Score based on children's interests
+            event_text = f"{event.get('title', '')} {event.get('description', '')} {event.get('event_type', '')}".lower()
+            
+            for interest in user_profile['all_interests']:
+                if interest.lower() in event_text:
+                    score += 15
+            
+            # Score based on age appropriateness
+            age_keywords = {
+                "toddler": ["toddler", "baby", "infant", "ages 0-2", "under 3"],
+                "preschooler": ["preschool", "ages 3-5", "4 year", "5 year"],
+                "early_elementary": ["elementary", "ages 6-8", "school age"],
+                "late_elementary": ["kids", "children", "ages 9-12", "youth"]
+            }
+            
+            for age_group in user_profile['age_ranges']:
+                if age_group in age_keywords:
+                    for keyword in age_keywords[age_group]:
+                        if keyword in event_text:
+                            score += 10
+            
+            # Boost score for highly rated venues
+            venue_rating = event.get('venue_rating', 0)
+            if venue_rating and venue_rating >= 4.5:
+                score += 10
+            elif venue_rating and venue_rating >= 4.0:
+                score += 5
+            
+            # Boost score for events with good reviews
+            venue_reviews = event.get('venue_reviews', 0)
+            if venue_reviews and venue_reviews > 50:
+                score += 5
+            
+            # Boost for family-friendly indicators
+            family_keywords = ["family", "kids", "children", "parent", "all ages"]
+            for keyword in family_keywords:
+                if keyword in event_text:
+                    score += 8
+                    break
+            
+            # Boost for educational events
+            educational_keywords = ["workshop", "class", "learn", "educational", "science", "museum"]
+            for keyword in educational_keywords:
+                if keyword in event_text:
+                    score += 5
+                    break
+            
+            event["personalization_score"] = score
+            event["ai_reasoning"] = "Rule-based fallback scoring"
+            
+        return events
+
+    def get_cached_event_recommendations(self, user):
+        """Get today's cached event recommendations if they exist and are fresh."""
+        try:
+            today = datetime.now().date()
+            print(f"🔍 Checking for cached event recommendations for {user.email} on {today}")
+            
+            cached = UserEventRecommendation.objects.filter(
+                user=user,
+                created_at__date=today
+            ).first()
+            
+            if cached:
+                print(f"✅ Found cached event recommendation from {cached.created_at}")
+                
+                # Verify the user profile hasn't changed by comparing hash
+                print(f"🔍 Verifying user profile hash...")
+                children = Child.objects.filter(user=user)
+                current_profile = self.build_user_profile_for_events(user, children)
+                current_hash = self.get_profile_hash_for_events(current_profile)
+                
+                print(f"📊 Cached hash: {cached.user_profile_hash}")
+                print(f"📊 Current hash: {current_hash}")
+                
+                if cached.user_profile_hash == current_hash:
+                    print(f"✅ Profile hash matches - returning cached event recommendations")
+                    return cached
+                else:
+                    print(f"❌ User profile changed for {user.email}, invalidating today's event cache")
+                    cached.delete()
+                    return None
+            else:
+                print(f"❌ No cached event recommendations found for {user.email} today")
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ Error checking event cache for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def get_profile_hash_for_events(self, user_profile):
+        """Generate a hash of the user profile for cache invalidation."""
+        # Create a stable string representation of the profile
+        profile_string = json.dumps(user_profile, sort_keys=True)
+        return hashlib.md5(profile_string.encode()).hexdigest()
+
+    def generate_and_cache_event_recommendations(self, user, latitude, longitude, radius, event_types, date_range):
+        """Generate and cache event recommendations for a user."""
+        try:
+            print(f"🔄 generate_and_cache_event_recommendations for {user.email}")
+            print(f"📍 Location: {latitude}, {longitude} (radius: {radius} miles)")
+            print(f"🎪 Event types: {event_types}, Date range: {date_range}")
+            
+            # Get user's children and their data
+            children = Child.objects.filter(user=user)
+            print(f"👶 Found {children.count()} children for profile building")
+            
+            # Build user profile for LLM
+            profile_start = time.time()
+            user_profile = self.build_user_profile_for_events(user, children)
+            profile_time = round((time.time() - profile_start) * 1000, 2)
+            print(f"👤 Built user profile in {profile_time}ms: {user_profile}")
+            
+            # Generate custom search queries using LLM
+            llm_start = time.time()
+            custom_queries = self.generate_event_llm_queries(user_profile, f"{latitude},{longitude}")
+            llm_time = round((time.time() - llm_start) * 1000, 2)
+            print(f"🤖 Generated {len(custom_queries)} LLM queries in {llm_time}ms: {custom_queries}")
+            print(f"🤖 Custom queries: {custom_queries}")
+            #input("Press Enter to continue...")
+            
+            # Use top 2 queries for testing
+            custom_queries = custom_queries[:2]
+
+            # Get recommended events
+            search_start = time.time()
+            recommended_events = asyncio.run(self.get_recommended_events(
+                custom_queries, latitude, longitude, radius, date_range
+            ))
+            search_time = round((time.time() - search_start) * 1000, 2)
+            print(f"🔍 Found {len(recommended_events)} events in {search_time}ms")
+            
+            # Add personalization scores
+            scoring_start = time.time()
+            scored_events = self.score_events_for_user(recommended_events, user_profile)
+            scoring_time = round((time.time() - scoring_start) * 1000, 2)
+            print(f"📊 Scored {len(scored_events)} events in {scoring_time}ms")
+            
+            # Sort by personalization score
+            scored_events.sort(key=lambda x: x.get("personalization_score", 0), reverse=True)
+            print(f"📈 Top 3 scored events: {[(e.get('title', 'Unknown'), e.get('personalization_score', 0)) for e in scored_events[:3]]}")
+            
+            # Limit to top 10 for event recommendations
+            daily_recommendations = scored_events[:10]
+            print(f"🎯 Selected top {len(daily_recommendations)} events for recommendations")
+            
+            # Cache the results for today
+            today = datetime.now().date()
+            profile_hash = self.get_profile_hash_for_events(user_profile)
+            
+            print(f"💾 Caching event recommendations for {user.email}")
+            print(f"📊 Profile hash: {profile_hash}")
+            
+            # Create or update UserEventRecommendation
+            cache_start = time.time()
+            cached_recommendation, created = UserEventRecommendation.objects.update_or_create(
+                user=user,
+                date_generated=today,
+                defaults={
+                    'user_profile_hash': profile_hash,
+                    'custom_queries': custom_queries,
+                    'locations_searched': [f"{latitude},{longitude}"],
+                    'total_results': len(scored_events)
+                }
+            )
+            
+            if created:
+                print(f"✅ Created new UserEventRecommendation for {user.email}")
+            else:
+                print(f"🔄 Updated existing UserEventRecommendation for {user.email}")
+                # Clear existing events for this recommendation
+                UserRecommendationEvent.objects.filter(user_recommendation=cached_recommendation).delete()
+                print(f"🗑️ Cleared existing events for updated recommendation")
+            
+            # Create Event objects and UserRecommendationEvent relationships
+            saved_events = 0
+            failed_events = 0
+            
+            for rank, event_data in enumerate(daily_recommendations, 1):
+                try:
+                    # Get or create the Event object
+                    event, event_created = Event.objects.get_or_create(
+                        event_id=event_data.get('id'),
+                        defaults={
+                            'title': event_data.get('title', ''),
+                            'description': event_data.get('description', ''),
+                            'start_date': event_data.get('start_date', ''),
+                            'when': event_data.get('when', ''),
+                            'address': event_data.get('address', []),
+                            'formatted_address': event_data.get('formatted_address', ''),
+                            'latitude': event_data.get('event_latitude'),
+                            'longitude': event_data.get('event_longitude'),
+                            'venue_name': event_data.get('venue_name', ''),
+                            'venue_rating': event_data.get('venue_rating'),
+                            'venue_reviews': event_data.get('venue_reviews'),
+                            'link': event_data.get('link', ''),
+                            'thumbnail': event_data.get('thumbnail', ''),
+                            'image': event_data.get('image', ''),
+                            'event_type': event_data.get('event_type', ''),
+                            'has_tickets': event_data.get('has_tickets', False),
+                            'ticket_info': event_data.get('ticket_info', []),
+                            'ticket_sources': event_data.get('ticket_sources', []),
+                            'source': event_data.get('source', 'serp_api')
+                        }
+                    )
+                    
+                    # Create the recommendation relationship
+                    UserRecommendationEvent.objects.create(
+                        user_recommendation=cached_recommendation,
+                        event=event,
+                        personalization_score=event_data.get('personalization_score', 0),
+                        searched_location=f"{latitude},{longitude}",
+                        source_query=event_data.get('source_query', 'default'),
+                        recommendation_rank=rank
+                    )
+                    
+                    saved_events += 1
+                    if event_created:
+                        print(f"✅ Created new event: {event_data.get('title', 'Unknown')} (rank {rank})")
+                    else:
+                        print(f"🔄 Updated existing event: {event_data.get('title', 'Unknown')} (rank {rank})")
+                    
+                except Exception as e:
+                    failed_events += 1
+                    print(f"❌ Error saving event {event_data.get('id', 'unknown')}: {e}")
+                    continue
+            
+            cache_time = round((time.time() - cache_start) * 1000, 2)
+            print(f"💾 Caching completed in {cache_time}ms")
+            print(f"📊 Saved {saved_events} events, {failed_events} failed")
+            print(f"✅ Generated {len(daily_recommendations)} event recommendations for {user.email}")
+            
+            return {
+                "results": daily_recommendations,
+                "user_profile": user_profile,
+                "custom_queries": custom_queries,
+                "total_results": len(scored_events)
+            }
+            
+        except Exception as e:
+            print(f"❌ Error generating event recommendations for {user.email}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
+
+    def add_location_to_search_history(self, user, location_key):
+        """Add a location to user's search history (max 10 recent locations)."""
+        try:
+            # Get current search history
+            history = user.search_history_locations if user.search_history_locations else []
+            
+            # Remove location if it already exists (to move it to front)
+            if location_key in history:
+                history.remove(location_key)
+            
+            # Add to front of list
+            history.insert(0, location_key)
+            
+            # Keep only last 10 searches
+            history = history[:10]
+            
+            # Update user
+            user.search_history_locations = history
+            user.save(update_fields=['search_history_locations'])
+            
+            print(f"Added {location_key} to search history for {user.email}")
+            
+        except Exception as e:
+            print(f"Error updating search history for {user.email}: {e}")
+
+    def extract_coordinates_from_address(self, address_list):
+        """Extract coordinates from address using geocoding."""
+        if not address_list:
+            return None, None
+        
+        # Join address components
+        full_address = ", ".join(address_list) if isinstance(address_list, list) else str(address_list)
+        
+        try:
+            url = f"https://maps.googleapis.com/maps/api/geocode/json?address={full_address}&key=AIzaSyBfW8nU2EoPK1Zg_bYOSREzqmRDwZfUgbM"
+            response = requests.get(url)
+            data = response.json()
+            
+            if data.get("results"):
+                location = data["results"][0]["geometry"]["location"]
+                return location["lat"], location["lng"]
+        except Exception as e:
+            print(f"❌ Error geocoding address {full_address}: {e}")
+        
+        return None, None
+
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """Calculate distance between two coordinates using haversine formula."""
+        if None in [lat1, lon1, lat2, lon2]:
+            return None
+        
+        R = 3958.8  # Radius of the Earth in miles
+        lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        distance = R * c
+        return round(distance, 2)
+
+    async def get_coordinates_from_zip(self, zip_code):
+        """Reuse existing geocoding method."""
+        events_api = EventsAPIView()
+        return await events_api.get_coordinates_from_zip(zip_code)
