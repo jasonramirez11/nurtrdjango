@@ -1217,7 +1217,7 @@ class PlacesAPIView(APIView):
                 return []
 
         print(f"Queries: {queries}")
-        #input("Press Enter to continue...")
+        
         
         query_to_category = {}
         if not queries:
@@ -2659,7 +2659,7 @@ class RecommendedPlacesAPIView(APIView):
             2. Consider safety and age-appropriateness
             3. Include both indoor and outdoor options
             4. Mix popular activities with unique local experiences
-            5. Each query should be 3-7 words
+            5. Each query should be 2-5 words
             6. Focus on kid-friendly venues that welcome families
 
             Return only a JSON array of search query strings, like:
@@ -2731,7 +2731,7 @@ class RecommendedPlacesAPIView(APIView):
         
         return queries[:6] if queries else ["family activities kids", "playgrounds parks", "kids museums"]
 
-    async def get_recommended_places(self, custom_queries, latitude, longitude, radius):
+    async def get_recommended_places(self, custom_queries, latitude, longitude, radius, max_queries=7):
         """Use existing places search infrastructure with custom queries."""
         all_places = []
         
@@ -2745,19 +2745,25 @@ class RecommendedPlacesAPIView(APIView):
             "key": PlacesAPIView.API_KEY
         }
 
-        curr_query = ' OR '.join(custom_queries[:2])
+        # Limit to 3 queries
+        #curr_query = ' OR '.join(custom_queries[:3])
             
         try:
             places_api = PlacesAPIView()
             async with aiohttp.ClientSession() as session:
-                results = await places_api.async_fetch_all_places(search_params, session, max_results=15, queries=[curr_query])
+                results = await places_api.async_fetch_all_places(
+                    search_params,
+                    session,
+                    max_results=15,
+                    queries=custom_queries[:max_queries]
+                )
                 
             # Process images for each place using the existing pipeline
             if results:
                 print(f"Processing images for {len(results)} places from recommendations...")
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 
-                with ThreadPoolExecutor(max_workers=10) as executor:
+                with ThreadPoolExecutor(max_workers=20) as executor:
                     future_to_place = {
                         executor.submit(process_images_for_place, place): place
                         for place in results
@@ -2777,11 +2783,11 @@ class RecommendedPlacesAPIView(APIView):
                             place["imagePlaces"] = []
                 
             for place in results:
-                place["source_query"] = curr_query
+                #place["source_query"] = curr_query
                 all_places.append(place)
 
         except Exception as e:
-            print(f"Error searching with query '{curr_query}': {e}")
+            print(f"Error searching with queries {custom_queries}: {e}")
         
         # Remove duplicates based on place_id
         unique_places = []
@@ -2827,61 +2833,94 @@ class RecommendedPlacesAPIView(APIView):
                     }
                     places_data.append(place_info)
 
-                # Create the prompt
+                # Create the prompt with individual child profiles
                 child_count = user_profile.get('total_children', 1)
                 child_plural = "children" if child_count > 1 else "child"
                 
+                # Format individual child profiles (without names)
+                child_profiles = []
+                for i, child in enumerate(user_profile.get('children', []), 1):
+                    child_profile = f"""
+                Child #{i}:
+                - Age: {child.get('age', 'Unknown')} years old ({child.get('age_group', 'Unknown')} stage)
+                - Primary Interests: {', '.join(child.get('interests', []))}
+                - Developmental Stage: {child.get('age_group', 'Unknown')}"""
+                    child_profiles.append(child_profile)
+                
+                children_section = '\n'.join(child_profiles) if child_profiles else "No children data available"
+                
                 prompt = f"""
-                You are a family activity recommendation expert. Analyze these places and provide personalization scores (0-100) and engaging explanations for why each place would be perfect for this parent and their family.
+                You are a family activity recommendation expert. Analyze these places and provide personalization scores (70-100) and engaging explanations for why each place would be perfect for this parent and their children. IMPORTANT: Only return recommendations for the TOP 5 highest-scoring places.
             
                 FAMILY PROFILE:
-                - Number of children: {child_count}
-                - Child ages/stages: {', '.join(user_profile.get('age_ranges', []))}
-                - Family interests: {', '.join(user_profile.get('all_interests', []))}
-                - Location: {user_profile.get('location', 'Not specified')}
+                - Parent: {user_profile.get('user_name', 'Parent')}
+                - Total Children: {child_count}
+                
+                INDIVIDUAL CHILDREN PROFILES:
+                {children_section}
+                
+                COMBINED FAMILY DATA:
+                - All Age Groups: {', '.join(user_profile.get('age_ranges', []))}
+                - All Interests Combined: {', '.join(user_profile.get('all_interests', []))}
             
                 PLACES TO ANALYZE:
                 {json.dumps(places_data, indent=2)}
             
-                For each place, provide:
-                1. A personalization score (0-100) based on how well it matches the family's interests, ages, and preferences
-                2. A fun, engaging explanation (2-3 sentences) written directly to the parent but focused on what their {child_plural} will experience and enjoy
-            
-                IMPORTANT GUIDELINES:
-                - Write explanations directly to the parent (use "you", "your little ones", "your tiny explorers")
-                - Focus primarily on what the {child_plural} will experience, enjoy, and benefit from at this place
-                - Use fun, endearing terms like "little adventurers", "tiny explorers", "little scientists", "mini athletes", "creative spirits", "curious minds"
-                - Reference the number of children when relevant (e.g., "your {child_count} little adventurers will love...")
-                - DO NOT mention any specific names - only refer to fun, age-appropriate descriptors
-                - Emphasize the child-centered benefits: fun activities, learning opportunities, physical play, creativity
-                - Mention age-appropriate aspects and why they're perfect for their children's developmental stage
-                - Keep tone enthusiastic, playful, and child-focused with warm, friendly language
-                - Use action words that show excitement: "zoom", "splash", "discover", "create", "explore", "adventure"
+                SCORING CRITERIA (70-100 scale):
                 
-                EXAMPLE EXPLANATIONS:
+                **BASELINE SCORE: 70** (Every place starts at 70 - assumes basic family-friendliness)
+                
+                **PRIMARY SCORING FACTORS (+30 points available):**
+                1. **Interest Match (0-20 points)**: How well does this place align with the children's specific interests?
+                   - Perfect match (multiple interests): +15-20 points
+                   - Good match (1-2 interests): +10-14 points
+                   - Moderate match (related interests): +5-9 points
+                   - Poor match (no clear alignment): +0-4 points
+                
+                2. **Age Appropriateness (0-10 points)**: How suitable is this place for the children's ages and developmental stages?
+                   - Perfect for all children's ages: +8-10 points
+                   - Good for most children: +5-7 points
+                   - Suitable but not ideal: +2-4 points
+                   - Age concerns or limitations: +0-1 points
+                
+                **EXAMPLE SCORING:**
+                - STEM child + Science Museum = 70 baseline + 18 interest match + 9 age appropriate = 97
+                - Sports child + Indoor Playground = 70 baseline + 12 interest match + 8 age appropriate = 90
+                - Creative child + Art Studio = 70 baseline + 17 interest match + 10 age appropriate = 97
+                - Any child + Generic restaurant = 70 baseline + 2 interest match + 5 age appropriate = 77
+                
+                **SELECTION PROCESS:**
+                1. Score ALL places using the criteria above
+                2. Rank them by score (highest to lowest)
+                3. ONLY return the TOP 5 highest-scoring places in your response
+                4. If there are fewer than 5 places, return all of them IN ORDER BY RANKING
+            
+                EXPLANATION GUIDELINES:
+                - Write directly to the parent using "you", "your little ones", "your tiny explorers"
+                - Use fun, endearing terms: "little adventurers", "tiny explorers", "little scientists", "mini athletes", "creative spirits", "curious minds"
+                - DO NOT mention children's actual names - only use descriptive terms
+                - Focus on what the children will experience, enjoy, and benefit from
+                - Keep tone enthusiastic, playful, and child-focused
+                - Use exciting action words: "zoom", "splash", "discover", "create", "explore", "adventure"
+                
+                EXAMPLE EXPLANATIONS (keep these as strong examples):
                 - Indoor Playground: "Your little adventurers will absolutely love this vibrant indoor playground! With climbing structures perfectly sized for early elementary explorers, they'll spend hours zooming through tunnels, conquering obstacle courses, and making new friends in this safe, magical play wonderland."
                 - Science Museum: "This hands-on science museum is perfect for your curious little scientists! Your tiny explorers will be amazed by interactive exhibits where they can conduct real experiments, touch actual fossils, and discover how the world works through exciting play-based adventures."
                 - Adventure Park: "Your active little athletes will have an absolute blast at this outdoor adventure park! These mini daredevils will challenge themselves on age-appropriate zip lines, navigate thrilling obstacle courses, and build confidence while soaking up sunshine and fresh air fun."
             
-                Consider:
-                - Age appropriateness for their children's developmental stages
-                - How well the place matches their stated interests
-                - Safety and family-friendliness from a parent's perspective
-                - Educational value and developmental benefits
-                - Entertainment value and engagement potential
-                - Practical considerations (parking, facilities, etc.)
-            
-                Respond in this exact JSON format:
+                Respond in this exact JSON format with ONLY the top 5 places:
                 {{
                   "recommendations": [
                     {{
                       "index": 0,
-                      "score": 85,
-                      "explanation": "This indoor playground is perfect for your active family! With age-appropriate play structures designed for early elementary children, it offers a safe environment where your {child_plural} can burn energy while you relax knowing they're in a secure, well-maintained space."
+                      "score": 87,
+                      "explanation": "Your little adventurers will absolutely love this vibrant indoor playground! With climbing structures perfectly sized for early elementary explorers, they'll spend hours zooming through tunnels and making new friends in this magical play wonderland."
                     }}
                   ]
                 }}
+                EACH AND EVERY PLACE IN THE TOP 5 MUST HAVE A PERSONALIZED EXPLANATION AND A PERSONALIZATION SCORE.
                 """
+
 
                 try:
                     response = client.models.generate_content(
@@ -2927,7 +2966,9 @@ class RecommendedPlacesAPIView(APIView):
                 place["personalization_score"] = fallback_score
                 place["personalized_explanation"] = self._generate_fallback_explanation(place, user_profile)
 
-        return places
+        # Sort by personalization score and return top 5
+        places.sort(key=lambda x: x.get("personalization_score", 0), reverse=True)
+        return places[:5]
 
     def _calculate_fallback_score(self, place, user_profile):
         """Fallback scoring method when Gemini is unavailable."""
@@ -3080,7 +3121,7 @@ class RecommendedPlacesAPIView(APIView):
             locations_searched = list(locations_to_process.keys())
             
             print(f"Locations to process: {locations_to_process}")
-            #input("Press Enter to continue...")
+            
 
             # Search across all user's locations
             for location_key, location_data in locations_to_process.items():
@@ -3091,7 +3132,7 @@ class RecommendedPlacesAPIView(APIView):
                     # Generate custom search queries using LLM for this location
                     location_queries = self.generate_llm_queries(user_profile, location_key)
                     print(f"Location queries: {location_queries}")
-                    #input("Press Enter to continue...")
+
                     all_custom_queries.extend(location_queries)
                     
                     # Get places for this location
@@ -3120,7 +3161,7 @@ class RecommendedPlacesAPIView(APIView):
                     unique_places.append(place)
 
             print(f"Unique places: {len(unique_places)}")
-            #input("Press Enter to continue...")
+            
             
             # Add personalization scores
             scored_places = self.score_places_for_user(unique_places, user_profile)
@@ -3136,7 +3177,7 @@ class RecommendedPlacesAPIView(APIView):
             profile_hash = self.get_profile_hash(user_profile)
             
             print(f"Updating or creating today's recommendation for {user.email}")
-            #input("Press Enter to continue...")
+            
             
             # Update or create today's recommendation
             cached_recommendation, created = UserRecommendation.objects.update_or_create(
@@ -3568,12 +3609,12 @@ class BatchRecommendationProcessingAPIView(APIView):
             "key": PlacesAPIView.API_KEY
         }
 
-        curr_query = ' OR '.join(custom_queries[:2])
+        curr_query = ' OR '.join(custom_queries)
             
         try:
             places_api = PlacesAPIView()
             async with aiohttp.ClientSession() as session:
-                results = await places_api.async_fetch_all_places(search_params, session, max_results=15, queries=[curr_query])
+                results = await places_api.async_fetch_all_places(search_params, session, max_results=15, queries=custom_queries[:max_queries])
                 
             # Process images for each place using the existing pipeline
             if results:
@@ -3598,7 +3639,9 @@ class BatchRecommendationProcessingAPIView(APIView):
                         except Exception as e:
                             print(f"Error processing images for place {place.get('place_id', 'unknown')}: {e}")
                             place["imagePlaces"] = []
-                
+            else:
+                print(f"No results found for query '{curr_query}'")
+
             for place in results:
                 place["source_query"] = curr_query
                 all_places.append(place)
@@ -3614,7 +3657,8 @@ class BatchRecommendationProcessingAPIView(APIView):
             if place_id and place_id not in seen_ids:
                 seen_ids.add(place_id)
                 unique_places.append(place)
-        
+
+        print(f"Found {len(unique_places)} unique places for {custom_queries}")
         return unique_places
 
     def score_places_for_user(self, places, user_profile):
@@ -3762,7 +3806,6 @@ class BatchRecommendationProcessingAPIView(APIView):
             locations_searched = list(locations_to_process.keys())
             
             print(f"Locations to process: {locations_to_process}")
-            #input("Press Enter to continue...")
 
             # Search across all user's locations
             for location_key, location_data in locations_to_process.items():
@@ -3773,7 +3816,7 @@ class BatchRecommendationProcessingAPIView(APIView):
                     # Generate custom search queries using LLM for this location
                     location_queries = self.generate_llm_queries(user_profile, location_key)
                     print(f"Location queries: {location_queries}")
-                    #input("Press Enter to continue...")
+                    
                     all_custom_queries.extend(location_queries)
                     
                     # Get places for this location
@@ -3802,7 +3845,7 @@ class BatchRecommendationProcessingAPIView(APIView):
                     unique_places.append(place)
 
             print(f"Unique places: {len(unique_places)}")
-            #input("Press Enter to continue...")
+            
             
             # Add personalization scores
             scored_places = self.score_places_for_user(unique_places, user_profile)
@@ -3818,7 +3861,7 @@ class BatchRecommendationProcessingAPIView(APIView):
             profile_hash = self.get_profile_hash(user_profile)
             
             print(f"Updating or creating today's recommendation for {user.email}")
-            #input("Press Enter to continue...")
+            
             
             # Update or create today's recommendation
             cached_recommendation, created = UserRecommendation.objects.update_or_create(
@@ -4006,7 +4049,7 @@ class RecommendedEventsAPIView(APIView):
             print(f"   Date range: {date_range}")
             print(f"   Force refresh: {force_refresh}")
             
-            #input("Press Enter to continue...")
+            
 
             # Get coordinates from zip if provided
             if zip_code:
@@ -4119,7 +4162,7 @@ class RecommendedEventsAPIView(APIView):
             print(f"✅ POST Success (FRESH) - Generated {len(recommendation_data.get('results', []))} new event recommendations")
             print(f"⏱️ Total POST execution time: {execution_time}ms")
 
-            #input("Press Enter to continue...")
+            
             
             recommendation_data["execution_time_ms"] = execution_time
             recommendation_data["cached"] = False
@@ -4399,7 +4442,7 @@ class RecommendedEventsAPIView(APIView):
                             all_events.append(event)
                             print(f"⚠️ Event added without distance verification (no coordinates)")
                     
-                    #input("Press Enter to continue...")
+                    
                     print(f"🔍 Found {len(event_results)} events for query: {query}")
                     print(f"✅ Added {len([e for e in event_results if e.get('distance') is not None and e.get('distance') <= radius])} events within radius")
                     
@@ -4694,7 +4737,7 @@ class RecommendedEventsAPIView(APIView):
             llm_time = round((time.time() - llm_start) * 1000, 2)
             print(f"🤖 Generated {len(custom_queries)} LLM queries in {llm_time}ms: {custom_queries}")
             print(f"🤖 Custom queries: {custom_queries}")
-            #input("Press Enter to continue...")
+            
             
             # Use top 2 queries for testing
             custom_queries = custom_queries[:2]

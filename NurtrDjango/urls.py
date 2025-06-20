@@ -39,8 +39,7 @@ urlpatterns = [
     path('api/events/recommended/', RecommendedEventsAPIView.as_view(), name='recommended_events'),
     path('api/image-download/', ImageDownloadAPIView.as_view(), name='image_download'),
     path('debug/urls/', show_urls),
-    # Add a direct path to the authenticate endpoint as a fallback
-    re_path(r'^api/users/authenticate/$', UserViewSet.as_view({'post': 'authenticate'}), name='user-authenticate'),
+    # Router handles the authenticate endpoint automatically
     #path('api/users/', UserCreateView.as_view(), name='user-create'), 
     #path('api/serve-image/', serve_image, name='serve_image'),
 ]
