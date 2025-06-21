@@ -1054,7 +1054,8 @@ class PlacesAPIView(APIView):
 
                 #if place_data.get('description') and place_data.get('popular_times'):
 
-                asyncio.create_task(save_or_update_db(place_data, db_place))
+                # Save to database synchronously to ensure images are persisted
+                await save_or_update_db(place_data, db_place)
                 return place_data
 
         except ObjectDoesNotExist:
@@ -1095,8 +1096,8 @@ class PlacesAPIView(APIView):
                 api_results["place_images"] = place_data.get("place_images", [])
                 api_results['reviews_list'] = place_data.get('reviews_list', [])
 
-                # Save/update DB with combined data in background
-                asyncio.create_task(save_or_update_db(place_data, db_place))
+                # Save/update DB with combined data synchronously to ensure images are persisted
+                await save_or_update_db(place_data, db_place)
 
                 # Return the updated place_data
                 place_data['source'] = "database_updated"
@@ -1105,8 +1106,8 @@ class PlacesAPIView(APIView):
                 # If no existing place_data, use API results directly
                 api_results["source"] = "api"
 
-                # Start the save/update operation in the background
-                asyncio.create_task(save_or_update_db(api_results, db_place))
+                # Save/update DB with API results synchronously to ensure images are persisted
+                await save_or_update_db(api_results, db_place)
 
                 return api_results
 
