@@ -2815,7 +2815,7 @@ class RecommendedPlacesAPIView(APIView):
             client = genai.Client(api_key=gemini_api_key)
 
             # Process places in batches to avoid token limits
-            batch_size = 20
+            batch_size = 50
             for i in range(0, len(places), batch_size):
                 batch = places[i:i + batch_size]
 
@@ -2823,7 +2823,7 @@ class RecommendedPlacesAPIView(APIView):
                 places_data = []
                 for idx, place in enumerate(batch):
                     place_info = {
-                        "index": i + idx,
+                        "index": idx + 1,
                         "name": place.get('title', 'Unknown'),
                         "description": place.get('description', ''),
                         "category": place.get('category', ''),
@@ -2913,13 +2913,13 @@ class RecommendedPlacesAPIView(APIView):
                 {{
                   "recommendations": [
                     {{
-                      "index": 0,
+                      "index": 2,
                       "score": 87,
                       "explanation": "Your little adventurers will absolutely love this vibrant indoor playground! With climbing structures perfectly sized for early elementary explorers, they'll spend hours zooming through tunnels and making new friends in this magical play wonderland."
                     }}
                   ]
                 }}
-                EACH AND EVERY PLACE IN THE TOP 5 MUST HAVE A PERSONALIZED EXPLANATION AND A PERSONALIZATION SCORE.
+                EACH AND EVERY PLACE IN THE TOP 5 MUST HAVE A PERSONALIZED EXPLANATION AND A PERSONALIZATION SCORE. The index of each place in the top 5 MUST BE THE EXACT INDEX OF THE PLACE IN THE ORIGINAL LIST OF PLACES.
                 """
 
 
@@ -2939,13 +2939,16 @@ class RecommendedPlacesAPIView(APIView):
                     result = response.parsed
                     
                     # Apply scores and explanations to places
+                    # Note: Gemini returns only top 5 places, so we need to map indices correctly
                     for recommendation in result.recommendations:
                         place_index = recommendation.index
-                        actual_index = place_index - i  # Adjust for batch offset
+                        actual_index = place_index - 1  # Adjust for batch offset
 
                         if 0 <= actual_index < len(batch):
                             batch[actual_index]["personalization_score"] = recommendation.score
                             batch[actual_index]["personalized_explanation"] = recommendation.explanation
+                        else:
+                            print(f"Warning: Recommendation index {place_index} (actual: {actual_index}) out of bounds for batch size {len(batch)} at offset {i}")
 
                 except Exception as e:
                     print(f"Error with Gemini API for batch {i // batch_size + 1}: {e}")
@@ -3163,9 +3166,14 @@ class RecommendedPlacesAPIView(APIView):
 
             print(f"Unique places: {len(unique_places)}")
             
-            
+
+            start_time = time.time()
+
             # Add personalization scores
             scored_places = self.score_places_for_user(unique_places, user_profile)
+
+            end_time = time.time()
+            print(f"Personalization took {end_time - start_time} seconds")
             
             # Sort by personalization score
             scored_places.sort(key=lambda x: x.get("personalization_score", 0), reverse=True)
@@ -3178,7 +3186,6 @@ class RecommendedPlacesAPIView(APIView):
             profile_hash = self.get_profile_hash(user_profile)
             
             print(f"Updating or creating today's recommendation for {user.email}")
-            
             
             # Update or create today's recommendation
             cached_recommendation, created = UserRecommendation.objects.update_or_create(
@@ -4488,7 +4495,7 @@ class RecommendedEventsAPIView(APIView):
                 event_summaries = []
                 for idx, event in enumerate(batch):
                     event_summary = {
-                        "index": idx,
+                        "index": i + idx,  # Use global index, not batch-local index
                         "id": event.get('id', 'unknown'),
                         "title": event.get('title', ''),
                         "description": event.get('description', ''),
@@ -4533,6 +4540,8 @@ class RecommendedEventsAPIView(APIView):
                 - Accessibility for families (parking, strollers, etc.)
                 - Weather considerations for outdoor events
                 - Time appropriateness (not too late for young children)
+
+                IMPORTANT: For each event, you MUST use the exact same "index" value that was provided in the event data above. Do NOT change or renumber the indices.
 
                 Return ONLY a JSON array with scores for each event in the same order:
                 [
