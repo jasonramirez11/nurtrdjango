@@ -38,6 +38,7 @@ urlpatterns = [
     path('api/events/', EventsAPIView.as_view(), name='events_api'),
     path('api/events/recommended/', RecommendedEventsAPIView.as_view(), name='recommended_events'),
     path('api/image-download/', ImageDownloadAPIView.as_view(), name='image_download'),
+    path('api/payment/', include('payment.urls')),
     path('debug/urls/', show_urls),
     # Router handles the authenticate endpoint automatically
     #path('api/users/', UserCreateView.as_view(), name='user-create'), 

@@ -19,6 +19,10 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Debug: Print loaded webhook secret
+webhook_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
+print(f"🔧 Django startup - Loaded webhook secret: {webhook_secret[:20] if webhook_secret else 'NOT FOUND'}...")
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -103,6 +107,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'users',
     'NurtrDjango',
+    'payment',
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
@@ -180,7 +185,7 @@ DATABASES = {
         'USER': os.getenv('DB_USER', 'postgres'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'webtest123'),
         'HOST': os.getenv('DB_HOST', 'db'),
-        'PORT': '5432',
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
 
@@ -268,3 +273,8 @@ CACHES = {
     }
 }
 # --- End Caching Configuration ---
+
+# Stripe Configuration
+STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY', '')
+STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '')

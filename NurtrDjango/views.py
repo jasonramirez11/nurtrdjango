@@ -108,6 +108,12 @@ class UserViewSet(viewsets.ModelViewSet):
         print("user_data", user_data)
         return Response(user_data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def me(self, request):
+        """Get current authenticated user's profile."""
+        user_data = app_serializers.UserSerializer(request.user, context={'request': request}).data
+        return Response(user_data, status=status.HTTP_200_OK)
+
     def create(self, request, *args, **kwargs):
         """Custom signup method to return an auth token after successful registration."""
         serializer = self.get_serializer(data=request.data)
