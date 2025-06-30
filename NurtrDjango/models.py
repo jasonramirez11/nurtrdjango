@@ -192,3 +192,24 @@ class UserRecommendationEvent(models.Model):
     
     def __str__(self):
         return f"{self.event.title} (Rank #{self.recommendation_rank} for {self.user_recommendation.user.email})"
+
+
+class EmailSubscription(models.Model):
+    """Model to store email newsletter subscriptions."""
+    email = models.EmailField(unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+    brevo_contact_id = models.CharField(max_length=255, blank=True, null=True, help_text="Brevo contact ID for this subscriber")
+    source = models.CharField(max_length=100, default="website", help_text="Source of the subscription (website, api, etc.)")
+    subscribed_at = models.DateTimeField(auto_now_add=True)
+    unsubscribed_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "Email Subscription"
+        verbose_name_plural = "Email Subscriptions"
+        ordering = ['-subscribed_at']
+    
+    def __str__(self):
+        status = "Active" if self.is_active else "Inactive"
+        return f"{self.email} ({status})"

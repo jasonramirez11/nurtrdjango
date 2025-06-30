@@ -5,7 +5,7 @@ from .views import UserViewSet
 from users.views import UserCreateView ,ChildViewSet
 from django.conf.urls.static import static
 from NurtrDjango import settings
-from .views import PlacesAPIView, serve_image, EventsAPIView, RecommendedPlacesAPIView, RecommendedEventsAPIView
+from .views import PlacesAPIView, serve_image, EventsAPIView, RecommendedPlacesAPIView, RecommendedEventsAPIView, EmailSubscriptionAPIView
 from django.http import HttpResponse
 from django.urls import get_resolver
 from .views import ImageDownloadAPIView
@@ -38,6 +38,7 @@ urlpatterns = [
     path('api/events/', EventsAPIView.as_view(), name='events_api'),
     path('api/events/recommended/', RecommendedEventsAPIView.as_view(), name='recommended_events'),
     path('api/image-download/', ImageDownloadAPIView.as_view(), name='image_download'),
+    path('api/newsletter/subscribe/', EmailSubscriptionAPIView.as_view(), name='email_subscription'),
     path('api/payment/', include('payment.urls')),
     path('debug/urls/', show_urls),
     # Router handles the authenticate endpoint automatically

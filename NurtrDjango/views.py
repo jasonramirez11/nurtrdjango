@@ -4943,3 +4943,115 @@ class RecommendedEventsAPIView(APIView):
         """Reuse existing geocoding method."""
         events_api = EventsAPIView()
         return await events_api.get_coordinates_from_zip(zip_code)
+
+
+class EmailSubscriptionAPIView(APIView):
+    """API endpoint for email newsletter subscriptions with Brevo integration."""
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser]
+    
+    def post(self, request):
+        """Handle email subscription with Brevo integration."""
+        try:
+            email = request.data.get('email', '').strip().lower()
+            
+            # Validate email
+            if not email:
+                return Response({
+                    'error': 'Email address is required',
+                    'success': False
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Basic email validation
+            import re
+            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_pattern, email):
+                return Response({
+                    'error': 'Please enter a valid email address',
+                    'success': False
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Import Brevo SDK
+            import sib_api_v3_sdk
+            from sib_api_v3_sdk.rest import ApiException
+            
+            # Configure Brevo API
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key['api-key'] = settings.BREVO_API_KEY
+            
+            # Create API instance
+            api_instance = sib_api_v3_sdk.ContactsApi(sib_api_v3_sdk.ApiClient(configuration))
+            
+            # Check if email already exists in database
+            from .models import EmailSubscription
+            subscription, created = EmailSubscription.objects.get_or_create(
+                email=email,
+                defaults={
+                    'is_active': True,
+                    'source': 'website'
+                }
+            )
+            
+            if not created and subscription.is_active:
+                return Response({
+                    'message': 'You are already subscribed to our newsletter',
+                    'success': True
+                }, status=status.HTTP_200_OK)
+            
+            # Prepare contact data for Brevo
+            create_contact = sib_api_v3_sdk.CreateContact(
+                email=email,
+                list_ids=[int(settings.BREVO_LIST_ID)]  # Add to newsletter list
+            )
+            
+            try:
+                # Create contact in Brevo
+                api_response = api_instance.create_contact(create_contact)
+                
+                # Update subscription with Brevo contact ID
+                subscription.brevo_contact_id = str(api_response.id) if hasattr(api_response, 'id') else None
+                subscription.is_active = True
+                subscription.unsubscribed_at = None
+                subscription.save()
+                
+                return Response({
+                    'message': 'Thank you for subscribing! Check your email for confirmation.',
+                    'success': True
+                }, status=status.HTTP_201_CREATED)
+                
+            except ApiException as e:
+                # Handle Brevo API errors
+                if e.status == 400:
+                    error_body = json.loads(e.body) if e.body else {}
+                    error_code = error_body.get('code', '')
+                    
+                    if error_code == 'duplicate_parameter':
+                        # Contact already exists in Brevo, just update our database
+                        subscription.is_active = True
+                        subscription.unsubscribed_at = None
+                        subscription.save()
+                        
+                        return Response({
+                            'message': 'You are already subscribed to our newsletter',
+                            'success': True
+                        }, status=status.HTTP_200_OK)
+                    
+                    return Response({
+                        'error': 'Invalid email address',
+                        'success': False
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                
+                # Log other API errors
+                print(f"Brevo API error: {e}")
+                return Response({
+                    'error': 'There was an error processing your subscription. Please try again.',
+                    'success': False
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+        except Exception as e:
+            # Log unexpected errors
+            print(f"Email subscription error: {e}")
+            return Response({
+                'error': 'An unexpected error occurred. Please try again.',
+                'success': False
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
