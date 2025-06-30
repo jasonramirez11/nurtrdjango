@@ -280,5 +280,5 @@ STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET', '')
 
 # Brevo Configuration
-BREVO_API_KEY = os.getenv('BREVO_API_KEY', 'xkeysib-6d115073098c04ead2dc5e34d79a6bac20adb942e960a16e6ef97ee094779a76-Ol6KmpTTGY4eqBLLCalled')
+BREVO_API_KEY = os.getenv('BREVO_API_KEY', '')
 BREVO_LIST_ID = os.getenv('BREVO_LIST_ID', '5')  # Nurtr Sign Ups list ID
