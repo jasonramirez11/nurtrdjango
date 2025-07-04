@@ -72,6 +72,27 @@ storage_client = Client()
 
 User = get_user_model()
 
+def transform_hours_array(hours_data):
+    """Transform SERP hours array format into structured object format"""
+    if not hours_data:
+        return {}
+    
+    # If it's already an object/dict, return as-is
+    if isinstance(hours_data, dict) and not isinstance(hours_data, list):
+        return hours_data
+    
+    # If it's a list (SERP format), transform to object
+    if isinstance(hours_data, list):
+        structured_hours = {}
+        for day_obj in hours_data:
+            if isinstance(day_obj, dict):
+                for day, hours in day_obj.items():
+                    structured_hours[day] = hours
+        return structured_hours
+    
+    # If it's neither list nor dict, return empty object
+    return {}
+
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.order_by('-id')
 
@@ -378,7 +399,87 @@ def process_images_for_place(place, min_images=1):
         else:
             max_images = 5
 
-        image_urls = get_images_from_serp(place["photos_link"], max_images=max_images)
+        # Check if photos_link exists, if not, fetch it using place_id
+        photos_link = place.get("photos_link")
+        if not photos_link:
+            place_id = place.get('place_id', place.get('id'))
+            print(f"No photos_link available for place ID {place_id}, attempting to fetch from SERP API")
+            
+            try:
+                # Use SERP API to get place details and extract photos_link
+                params = {
+                    "engine": "google_maps",
+                    "api_key": SERP_API_KEY,
+                    "place_id": place_id,
+                }
+                results = serpapi.search(params)
+                place_results = results.get('place_results', {})
+                photos_link = place_results.get('photos_link')
+                
+                if photos_link:
+                    print(f"Found photos_link via SERP API for place ID {place_id}")
+                    # Update the place data with the new photos_link for future use
+                    place["photos_link"] = photos_link
+                    
+                    # Capture additional data that might be missing while we have the SERP response
+                    print(f"Enriching place data with additional SERP API data for place ID {place_id}")
+                    
+                    # Only update fields if they're missing or empty in the current place data
+                    if not place.get("description"):
+                        place["description"] = place_results.get("description", "")
+                    
+                    if not place.get("hours") and not place.get("operating_hours"):
+                        serp_hours = place_results.get("hours", [])
+                        print(f"🕐 SERP hours data for {place_id}: {serp_hours}")
+                        print(f"🕐 SERP hours data type: {type(serp_hours)}")
+                        if isinstance(serp_hours, list):
+                            print(f"🕐 SERP hours array length: {len(serp_hours)}")
+                            for i, day_hours in enumerate(serp_hours):
+                                print(f"🕐 Day {i}: {day_hours}")
+                        place["hours"] = serp_hours
+                        place["operating_hours"] = serp_hours
+                    
+                    if not place.get("popular_times"):
+                        place["popular_times"] = place_results.get("popular_times", [])
+                    
+                    if not place.get("reviews_link"):
+                        place["reviews_link"] = place_results.get("reviews_link", "")
+                    
+                    if not place.get("extensions"):
+                        place["extensions"] = place_results.get("extensions", {})
+                    
+                    # Update rating and reviews if SERP has more recent data
+                    if place_results.get("rating") and (not place.get("rating") or place_results.get("rating") > place.get("rating", 0)):
+                        place["rating"] = place_results.get("rating")
+                    
+                    if place_results.get("reviews") and (not place.get("reviews") or place_results.get("reviews") > place.get("reviews", 0)):
+                        place["reviews"] = place_results.get("reviews")
+                        place["userRatingCount"] = place_results.get("reviews")
+                    
+                    # Update address information if missing
+                    if not place.get("address"):
+                        place["address"] = place_results.get("address", "")
+                    
+                    if not place.get("formattedAddress"):
+                        place["formattedAddress"] = place_results.get("address", "")
+                    
+                    # Update type information if missing
+                    if not place.get("type"):
+                        place["type"] = place_results.get("type", "")
+                    
+                    if not place.get("types") or len(place.get("types", [])) == 0:
+                        place["types"] = place_results.get("types", [])
+                    
+                    print(f"Successfully enriched place data for {place_id}")
+                else:
+                    print(f"No photos_link found in SERP API response for place ID {place_id}")
+                    return []
+                    
+            except Exception as e:
+                print(f"Error fetching photos_link from SERP API for place ID {place_id}: {e}")
+                return []
+            
+        image_urls = get_images_from_serp(photos_link, max_images=max_images)
 
         if not image_urls:
             print(f"No image URLs found for place ID {place.get('place_id', place.get('id'))}")
@@ -628,8 +729,8 @@ class PlacesAPIView(APIView):
                                 formatted_address=api_result.get("formattedAddress"),
                                 rating=api_result.get("rating"),
                                 reviews=api_result.get("reviews") or api_result.get("userRatingCount"),
-                                hours=api_result.get("operating_hours", {}),
-                                place_images=api_result.get("imagePlaces", []), # Save image URLs
+                                hours=api_result.get("hours", api_result.get("operating_hours", [])),
+                                place_images=[], # Images will be processed and uploaded to GCS later
                                 reviews_list=api_result.get("reviews_list", []) # Save reviews list if present in api_result
                             )
                             new_place.save()
@@ -815,7 +916,7 @@ class PlacesAPIView(APIView):
                                                 formatted_address=place.get("formattedAddress"),
                                                 rating=place.get("rating"),
                                                 reviews=place.get("reviews") or place.get("userRatingCount"),
-                                                hours=place.get("operating_hours", {}),
+                                                hours=place.get("hours", place.get("operating_hours", [])),
                                                 place_images=processed_urls,  # Store processed images
                                                 reviews_list=place.get("reviews_list", []),
                                                 popular_times=place.get("popular_times", []),
@@ -898,6 +999,8 @@ class PlacesAPIView(APIView):
                     if data.get("rating") and (place_to_save.rating is None or data.get("rating") > place_to_save.rating): place_to_save.rating = data.get("rating"); update_fields.append('rating')  # Example: update rating if API's is higher
                     # Add category field if it exists in data
                     if data.get("category") and not place_to_save.category: place_to_save.category = data.get("category"); update_fields.append('category')
+                    # Update photos_link if present in data and missing in DB
+                    if data.get("photos_link") and not place_to_save.photos_link: place_to_save.photos_link = data.get("photos_link"); update_fields.append('photos_link')
                     # Add more fields as needed
                     place_to_save.place_images = data.get("place_images", [])
                     update_fields.append('place_images')
@@ -923,7 +1026,7 @@ class PlacesAPIView(APIView):
                         longitude=lon_val,
                         type=data.get("type"),
                         types=data.get("types", []),
-                        hours=data.get("hours", data.get("operating_hours", {})),
+                        hours=data.get("hours", data.get("operating_hours", [])),
                         address=data.get("address"),
                         extensions=data.get("extensions", {}),
                         display_name=(data.get("displayName", {}).get("text") or data.get("title")),
@@ -945,7 +1048,7 @@ class PlacesAPIView(APIView):
         try:
             get_place_from_db = sync_to_async(Place.objects.get)
             db_place = await get_place_from_db(place_id=place_id)
-            print(f"Found place details in database for ID: {place_id}")
+            print(f"Found place details in database for ID: {place_id}: {db_place}")
 
             place_data = {
                 "place_id": db_place.place_id,
@@ -979,9 +1082,29 @@ class PlacesAPIView(APIView):
                 "source": "database"
             }
 
+            # Log all available place data for debugging with actual values
+            print(f"📊 Place data summary for {place_id}:")
+            print(f"  - Title: {db_place.title}")
+            desc = db_place.description or ''
+            print(f"  - Description: {desc[:100]}{'...' if len(desc) > 100 else ''}")
+            print(f"  - Rating: {db_place.rating}")
+            print(f"  - Reviews count: {db_place.reviews}")
+            print(f"  - Address: {db_place.address}")
+            print(f"  - Formatted address: {db_place.formatted_address}")
+            print(f"  - Hours: {db_place.hours}")
+            print(f"  - Popular times: {len(db_place.popular_times or [])} entries")
+            print(f"  - Reviews list: {len(db_place.reviews_list or [])} reviews")
+            print(f"  - Photos link: {db_place.photos_link}")
+            print(f"  - Reviews link: {db_place.reviews_link}")
+            print(f"  - Types: {db_place.types}")
+            print(f"  - Category: {db_place.category}")
+            print(f"  - Extensions: {db_place.extensions}")
+            print(f"  - Place images: {len(db_place.place_images or [])} images")
+            print(f"  - Display name: {db_place.display_name}")
+
             # Check if images meet requirements
             if db_place.place_images and len(db_place.place_images) >= min_images and db_place.reviews_list and db_place.popular_times and db_place.description:
-                print(f"Database entry for {place_id} has sufficient images. Returning cached data.")
+                print(f"Database entry for {place_id} has sufficient data. Returning cached data.")
                 # Convert DB model to dict format expected by frontend
                 return place_data
             else:
@@ -1016,9 +1139,17 @@ class PlacesAPIView(APIView):
                         }
                         try:
                             results = serpapi.search(params).get('place_results', {})
+                            hours_data = results.get('hours')
+                            print(f"🕐 Place details SERP hours for {place_id}: {hours_data}")
+                            print(f"🕐 Place details SERP hours type: {type(hours_data)}")
+                            if isinstance(hours_data, list):
+                                print(f"🕐 Place details hours array length: {len(hours_data)}")
+                                for i, day_hours in enumerate(hours_data):
+                                    print(f"🕐 Place details day {i}: {day_hours}")
                             return {
                                 'description': results.get('description'),
-                                'popular_times': results.get('popular_times')
+                                'popular_times': results.get('popular_times'),
+                                'hours': hours_data
                             }
                         except Exception as e:
                             print(f"Error in API fetch: {e}")
@@ -1048,13 +1179,20 @@ class PlacesAPIView(APIView):
                             elif isinstance(result, dict):
 
                                 # This is likely the API result
+                                # Only update description if API has one AND we don't already have one
                                 if result.get('description'):
                                     place_data['description'] = result.get('description')
-                                else:
+                                elif not place_data.get('description'):
+                                    # Only set fallback if we don't already have a description
                                     place_data['description'] = 'No description available'
 
-                                if result.get('popular_times'):
+                                # Only update popular_times if API has data AND we don't already have it
+                                if result.get('popular_times') and not place_data.get('popular_times'):
                                     place_data['popular_times'] = result.get('popular_times')
+                                
+                                # Only update hours if API has data AND we don't already have it
+                                if result.get('hours') and not place_data.get('hours'):
+                                    place_data['hours'] = result.get('hours')
                         except Exception as e:
                             print(f"Error processing parallel task result: {e}")
 
@@ -1086,6 +1224,17 @@ class PlacesAPIView(APIView):
                 #return None
 
             print(f"Successfully fetched details from SerpAPI for place ID {place_id}")
+            
+            # Log the hours data from main SERP API call
+            main_hours = api_results.get('hours')
+            print(f"🕐 Main SERP API hours for {place_id}: {main_hours}")
+            print(f"🕐 Main SERP API hours type: {type(main_hours)}")
+            if isinstance(main_hours, list):
+                print(f"🕐 Main SERP hours array length: {len(main_hours)}")
+                for i, day_hours in enumerate(main_hours):
+                    print(f"🕐 Main SERP day {i}: {day_hours}")
+            elif main_hours:
+                print(f"🕐 Main SERP hours (non-list): {main_hours}")
 
             # 4. Save/Update Database Asynchronously
             # If we have place_data from DB, update it with API results
@@ -1111,6 +1260,12 @@ class PlacesAPIView(APIView):
             else:
                 # If no existing place_data, use API results directly
                 api_results["source"] = "api"
+                
+                # Remove SERP image fields to prevent returning raw SERP image URLs
+                serp_image_fields = ["images", "thumbnail", "serpapi_thumbnail", "photos"]
+                for field in serp_image_fields:
+                    if field in api_results:
+                        del api_results[field]
 
                 # Save/update DB with API results synchronously to ensure images are persisted
                 await save_or_update_db(api_results, db_place)
@@ -1155,6 +1310,25 @@ class PlacesAPIView(APIView):
             return Response({"error": "Place not found"}, status=HTTP_404_NOT_FOUND)
 
         print(f"Returning place details for {place_id} from GET endpoint. Source: {place_details.get('source', 'unknown')}")
+        
+        # Log final response data summary with actual values
+        print(f"🚀 Final response data for {place_id}:")
+        print(f"  - Title: {place_details.get('title', 'N/A')}")
+        description = place_details.get('description', '')
+        print(f"  - Description: {description[:100]}{'...' if len(description) > 100 else ''}")
+        print(f"  - Rating: {place_details.get('rating', 'N/A')}")
+        print(f"  - Hours: {place_details.get('hours', 'N/A')}")
+        print(f"  - Popular times: {len(place_details.get('popular_times', []))} entries")
+        print(f"  - Reviews list: {len(place_details.get('reviews_list', []))} reviews")
+        print(f"  - Address: {place_details.get('address', 'N/A')}")
+        print(f"  - Formatted address: {place_details.get('formattedAddress', 'N/A')}")
+        print(f"  - Types: {place_details.get('types', [])}")
+        print(f"  - Photos link: {place_details.get('photos_link', 'N/A')}")
+        print(f"  - Reviews link: {place_details.get('reviews_link', 'N/A')}")
+        print(f"  - Display name: {place_details.get('displayName', 'N/A')}")
+        print(f"  - Extensions: {place_details.get('extensions', 'N/A')}")
+        print(f"  - Category: {place_details.get('category', 'N/A')}")
+        print(f"  - Source: {place_details.get('source', 'N/A')}")
 
         return Response(place_details, status=HTTP_200_OK)
 
@@ -2430,22 +2604,22 @@ class RecommendedPlacesAPIView(APIView):
                     "userRatingCount": place.reviews,  # For compatibility
                     
                     # Place metadata
-                    "types": place.types or [],
+                    "types": place.types if place.types is not None else [],
                     "type": place.type or "",
-                    "extensions": place.extensions or {},
-                    "displayName": {"text": place.title} if place.title else None,
+                    "extensions": place.extensions if place.extensions is not None else {},
+                    "displayName": {"text": place.display_name or place.title} if (place.display_name or place.title) else None,
                     
                     # Visual content
-                    "imagePlaces": place.place_images or [],
-                    "place_images": place.place_images or [],  # For compatibility
+                    "imagePlaces": place.place_images if place.place_images is not None else [],
+                    "place_images": place.place_images if place.place_images is not None else [],  # For compatibility
                     
                     # Operating information
-                    "operating_hours": place.hours or {},
-                    "hours": place.hours or {},  # For compatibility
-                    "popular_times": place.popular_times or [],
+                    "operating_hours": place.hours if place.hours is not None else {},
+                    "hours": place.hours if place.hours is not None else {},  # For compatibility
+                    "popular_times": place.popular_times if place.popular_times is not None else [],
                     
                     # Reviews data
-                    "reviews_list": place.reviews_list or [],
+                    "reviews_list": place.reviews_list if place.reviews_list is not None else [],
                     "reviews_link": place.reviews_link or "",
                     "photos_link": place.photos_link or "",
                     
@@ -3215,7 +3389,7 @@ class RecommendedPlacesAPIView(APIView):
                 try:
                     print(f"Place title and location: {place_data.get('title', place_data.get('name', ''))} {place_data.get('location', {}).get('latitude') or place_data.get('gps_coordinates', {}).get('latitude')} {place_data.get('location', {}).get('longitude') or place_data.get('gps_coordinates', {}).get('longitude')}")
 
-                    print(f"place score explanation: {place_data.get('personalized_explanation', '')}")
+                    #print(f"place score explanation: {place_data.get('personalized_explanation', '')}")
 
                     # Get or create the Place object
                     place, place_created = Place.objects.get_or_create(
@@ -3228,9 +3402,19 @@ class RecommendedPlacesAPIView(APIView):
                             'rating': place_data.get('rating'),
                             'reviews': place_data.get('reviews') or place_data.get('userRatingCount'),
                             'formatted_address': place_data.get('formattedAddress', place_data.get('vicinity', '')),
+                            'address': place_data.get('address', ''),
                             'types': place_data.get('types', []),
+                            'type': place_data.get('type', ''),
                             'place_images': place_data.get('imagePlaces', []),
                             'category': place_data.get('category', ''),
+                            'data_id': place_data.get('data_id', ''),
+                            'reviews_link': place_data.get('reviews_link', ''),
+                            'photos_link': place_data.get('photos_link', ''),
+                            'extensions': place_data.get('extensions', {}),
+                            'display_name': place_data.get('displayName', {}).get('text', ''),
+                            'hours': place_data.get('operating_hours', []) or place_data.get('hours', []),
+                            'reviews_list': place_data.get('reviews_list', []),
+                            'popular_times': place_data.get('popular_times', []),
                         }
                     )
                     
@@ -3908,9 +4092,19 @@ class BatchRecommendationProcessingAPIView(APIView):
                             'rating': place_data.get('rating'),
                             'reviews': place_data.get('reviews') or place_data.get('userRatingCount'),
                             'formatted_address': place_data.get('formattedAddress', place_data.get('vicinity', '')),
+                            'address': place_data.get('address', ''),
                             'types': place_data.get('types', []),
+                            'type': place_data.get('type', ''),
                             'place_images': place_data.get('imagePlaces', []),
                             'category': place_data.get('category', ''),
+                            'data_id': place_data.get('data_id', ''),
+                            'reviews_link': place_data.get('reviews_link', ''),
+                            'photos_link': place_data.get('photos_link', ''),
+                            'extensions': place_data.get('extensions', {}),
+                            'display_name': place_data.get('displayName', {}).get('text', ''),
+                            'hours': place_data.get('hours', []) or place_data.get('operating_hours', []),
+                            'reviews_list': place_data.get('reviews_list', []),
+                            'popular_times': place_data.get('popular_times', []),
                         }
                     )
                     
