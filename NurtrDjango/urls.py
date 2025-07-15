@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.urls import path, include, re_path
 from rest_framework_nested import routers
 from .views import UserViewSet
-from users.views import UserCreateView ,ChildViewSet
+from users.views import UserCreateView, ChildViewSet, UserActivityViewSet
 from django.conf.urls.static import static
 from NurtrDjango import settings
 from .views import PlacesAPIView, serve_image, EventsAPIView, RecommendedPlacesAPIView, RecommendedEventsAPIView, EmailSubscriptionAPIView
@@ -24,6 +24,7 @@ def show_urls(request):
 router = routers.DefaultRouter(trailing_slash=True)
 router.register(r'users', UserViewSet, basename='user')
 router.register(r'children', ChildViewSet)
+router.register(r'activities', UserActivityViewSet, basename='activity')
 
 def home_view(request):
     return HttpResponse("Welcome to the Nurtr Django backend!")

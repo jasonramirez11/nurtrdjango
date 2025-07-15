@@ -194,6 +194,40 @@ class UserRecommendationEvent(models.Model):
         return f"{self.event.title} (Rank #{self.recommendation_rank} for {self.user_recommendation.user.email})"
 
 
+class UserActivity(models.Model):
+    """Model for user-scheduled activities at places"""
+    STATUS_CHOICES = [
+        ('scheduled', 'Scheduled'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
+    ]
+    
+    user = models.ForeignKey(get_user_model(), on_delete=models.CASCADE, related_name='activities')
+    place = models.ForeignKey(Place, on_delete=models.CASCADE, related_name='user_activities')
+    
+    # Scheduling details
+    scheduled_date = models.DateField(help_text="Date for the activity")
+    start_time = models.TimeField(help_text="Start time for the activity")
+    end_time = models.TimeField(help_text="End time for the activity")
+    
+    # Activity details
+    title = models.CharField(max_length=255, blank=True, null=True, help_text="Custom activity name")
+    notes = models.TextField(blank=True, null=True, help_text="User notes about the activity")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='scheduled')
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['scheduled_date', 'start_time']
+        verbose_name = "User Activity"
+        verbose_name_plural = "User Activities"
+    
+    def __str__(self):
+        return f"{self.user.email} - {self.place.title} on {self.scheduled_date}"
+
+
 class EmailSubscription(models.Model):
     """Model to store email newsletter subscriptions."""
     email = models.EmailField(unique=True, db_index=True)
