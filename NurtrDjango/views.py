@@ -553,6 +553,23 @@ class PlacesAPIView(APIView):
             ip = request.META.get('REMOTE_ADDR')
         return ip
 
+    def is_valid_gcs_url(self, url):
+        """Check if a GCS URL is valid and accessible."""
+        if not url or not isinstance(url, str):
+            return False
+        
+        # Check if it's a proper GCS URL format
+        if not url.startswith('https://storage.googleapis.com/'):
+            return False
+        
+        try:
+            import requests
+            response = requests.head(url, timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"URL validation failed for {url}: {e}")
+            return False
+
     async def get_coordinates_from_zip(self, zip_code):
         """Fetch latitude and longitude from ZIP code using Geocoding API."""
         url = f"{self.GEOCODE_URL}?address={zip_code}+USA&key={self.API_KEY}"
@@ -840,8 +857,18 @@ class PlacesAPIView(APIView):
                     if not place.place_images or len(place.place_images) < min_images:
                         # If from database but needs images, add to processing list
                         places_needing_images.append(place_dict)
+                    elif len(place.place_images) == 1:
+                        # Special case: validate single image URL
+                        single_image_url = place.place_images[0]
+                        if not self.is_valid_gcs_url(single_image_url):
+                            print(f"Single image URL invalid for place {place.place_id}: {single_image_url}")
+                            places_needing_images.append(place_dict)
+                        else:
+                            # Single valid image, add to results
+                            processed_results.append(place_dict)
+                            print(f"Using cached place with valid single image: {place.place_id}")
                     else:
-                        # Has enough images, add directly to final results
+                        # Has multiple images, add directly to final results
                         processed_results.append(place_dict)
                         print(f"Using cached place with images: {place.place_id}")
 
