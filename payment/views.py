@@ -62,7 +62,8 @@ class CreateCheckoutSessionView(View):
                     'subscription_type': 'premium_plus',
                     'user_id': str(user.id),  # Store actual user ID
                     'user_email': user.email,  # Store user email for verification
-                }
+                },
+                allow_promotion_codes=True,
             )
 
             return JsonResponse({
@@ -196,20 +197,48 @@ def subscription_status(request):
     # Check subscription for this specific user
     try:
         subscription = UserSubscription.objects.get(user=user)
-        return JsonResponse({
-            'is_premium': subscription.is_premium(),
+        access_type = subscription.get_access_type()
+        has_premium_access = subscription.has_premium_access()
+        
+        response_data = {
+            'is_premium': has_premium_access,
             'plan_type': subscription.plan_type,
             'is_active': subscription.is_active,
-            'has_access_to_dashboard': subscription.is_premium(),  # Required for dashboard access
+            'has_access_to_dashboard': has_premium_access,  # Required for dashboard access
+            'access_type': access_type,  # 'paid_premium', 'trial', 'trial_expired', or 'free'
             'user_id': user.id,
             'user_email': user.email
-        })
+        }
+        
+        # Add trial-specific information if user is in trial
+        if subscription.is_trial_active:
+            response_data.update({
+                'is_trial': True,
+                'trial_expired': subscription.is_trial_expired(),
+                'trial_days_remaining': subscription.days_remaining_in_trial(),
+                'trial_end_date': subscription.trial_end_date.isoformat() if subscription.trial_end_date else None
+            })
+        else:
+            response_data.update({
+                'is_trial': False,
+                'trial_expired': False,
+                'trial_days_remaining': 0,
+                'trial_end_date': None
+            })
+        
+        return JsonResponse(response_data)
+        
     except UserSubscription.DoesNotExist:
         return JsonResponse({
             'is_premium': False,
             'plan_type': 'free',
             'is_active': False,
             'has_access_to_dashboard': False,
+            'access_type': 'free',
+            'is_trial': False,
+            'trial_expired': False,
+            'trial_days_remaining': 0,
+            'trial_end_date': None,
             'user_id': user.id,
             'user_email': user.email
         })

@@ -152,6 +152,30 @@ class UserViewSet(viewsets.ModelViewSet):
         # Generate authentication token
         token, created = Token.objects.get_or_create(user=user)
 
+        # Create 7-day free trial subscription for new user
+        from payment.models import UserSubscription
+        from datetime import timedelta
+        from django.utils import timezone
+        
+        try:
+            subscription, sub_created = UserSubscription.objects.get_or_create(
+                user=user,
+                defaults={
+                    'plan_type': 'premium_plus',
+                    'is_trial_active': True,
+                    'trial_start_date': timezone.now(),
+                    'trial_end_date': timezone.now() + timedelta(days=7),
+                    'is_active': False  # Not a paid subscription, just trial
+                }
+            )
+            if sub_created:
+                print(f"✅ Created 7-day free trial for user: {user.email}")
+            else:
+                print(f"⚠️ Subscription already exists for user: {user.email}")
+        except Exception as e:
+            print(f"⚠️ Failed to create trial subscription for {user.email}: {e}")
+            # Don't fail registration if trial creation fails
+
         # Prepare response with user data and token
         user_data = app_serializers.UserSerializer(user, context={'request': request}).data
         user_data['token'] = token.key  # Include token in response
