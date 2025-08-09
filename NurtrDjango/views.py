@@ -632,8 +632,10 @@ class PlacesAPIView(APIView):
         zip_code = data.get("zip_code")  # Get ZIP code if provided
         latitude = data.get("latitude", 40.712776)
         longitude = data.get("longitude", -74.005974)
-        radius = data.get("radius", 500)
+        radius_miles = data.get("radius", 25)  # Frontend sends miles
+        radius = radius_miles * 1609.34  # Convert miles to meters for internal use
         types = data.get("types", {})
+        category = data.get("category", "")  # Get category for special handling
         min_price = data.get("minPrice", 0)
         max_price = data.get("maxPrice", 500)
         filters = data.get("filters", [])
@@ -644,6 +646,11 @@ class PlacesAPIView(APIView):
         
         print('page', page)
         print('load more', data.get('load_more', False))
+        print('category', category)
+        
+        # Check if popular category is requested
+        is_popular_category = category.lower() in ['popular']
+        print(f'popular category requested: {is_popular_category}')
         
         if zip_code:
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
@@ -665,8 +672,15 @@ class PlacesAPIView(APIView):
 
         print(f"Params: {params}") # OK HERE
 
+        # Enhance search queries for popular category kids places
+        if is_popular_category:
+            queries = self.get_enhanced_kids_queries()
+            print(f'Enhanced kids queries for popular category: {queries}')
+        else:
+            queries = None
+            
         # Run asynchronous I/O to get place details from external API
-        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price))
+        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries))
 
         processed_results = [] # List to store final results (from DB or API)
 
@@ -737,6 +751,10 @@ class PlacesAPIView(APIView):
                     db_lon = float(place.longitude) if place.longitude is not None else None
                     place_data["distance"] = haversine(float(latitude), float(longitude), db_lat, db_lon)
 
+                    # Add categorization flags for popular category
+                    if is_popular_category:
+                        self.add_popular_category_flags(place_data)
+                    
                     # Add to processed results
                     processed_results.append(place_data)
 
@@ -787,6 +805,10 @@ class PlacesAPIView(APIView):
                     # Use the coordinates directly from the api_result for distance calculation
                     place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
 
+                    # Add categorization flags for popular category
+                    if is_popular_category:
+                        self.add_popular_category_flags(place_data)
+                    
                     # Add to processed results
                     processed_results.append(place_data)
 
@@ -798,11 +820,32 @@ class PlacesAPIView(APIView):
                 api_lat = api_result.get("location", {}).get("latitude")
                 api_lon = api_result.get("location", {}).get("longitude")
                 place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
+                
+                # Add categorization flags for popular category
+                if is_popular_category:
+                    self.add_popular_category_flags(place_data)
+                
                 processed_results.append(place_data)
 
         # Sort by distance if calculated
         #processed_results.sort(key=lambda x: x.get("distance", float("inf")))
 
+        # Sort trending places by review count (higher reviews first) for Popular category
+        if is_popular_category:
+            # Separate trending and non-trending places
+            trending_places = [p for p in processed_results if p.get('isTrending', False)]
+            non_trending_places = [p for p in processed_results if not p.get('isTrending', False)]
+            
+            # Sort trending places by review count (descending)
+            trending_places.sort(key=lambda x: x.get('reviews', 0) or x.get('userRatingCount', 0), reverse=True)
+            
+            # Recombine results with sorted trending places
+            processed_results = trending_places + non_trending_places
+        
+        # Limit results for non-popular searches when TESTING is True
+        if TESTING and not is_popular_category:
+            processed_results = processed_results[:10]
+        
         total_results = len(processed_results) # Use count from processed list
         paginated_results = processed_results # For now, returning all processed results
 
@@ -814,11 +857,91 @@ class PlacesAPIView(APIView):
             "execution_time_ms": execution_time
         }, status=HTTP_200_OK)
 
-    async def async_main(self, params, filters, min_price, max_price):
+    def get_enhanced_kids_queries(self):
+        """Enhanced search queries for kids places when Popular category is requested (optimized to 8 queries)"""
+        return [
+            "kids playground family fun center indoor outdoor play",
+            "children museum interactive exhibits art classes creative activities",
+            "kids activities birthday parties entertainment venues events",
+            "kids sports gymnastics martial arts swimming lessons physical",
+            "family restaurants kids menu playground dining food",
+            "petting zoo farm animals kids nature outdoor wildlife",
+            "kids dance music lessons library story time educational",
+            "family bowling laser tag activities arcade games entertainment"
+        ]
+    
+    def add_popular_category_flags(self, place_data):
+        """Add category flags based on rating and review criteria for Popular category"""
+        rating = place_data.get('rating', 0) or 0
+        reviews = place_data.get('reviews', 0) or place_data.get('userRatingCount', 0) or 0
+        
+        # Convert to float for comparison
+        try:
+            rating = float(rating)
+            reviews = int(reviews)
+        except (ValueError, TypeError):
+            rating = 0
+            reviews = 0
+        
+        # Initialize all flags to False
+        place_data['isTopPick'] = False
+        place_data['isTrending'] = False  
+        place_data['isHiddenGem'] = False
+        place_data['isLocalFavorite'] = False
+        
+        # Independent category assignment - each place can belong to multiple categories
+        # Categories are designed to minimize overlaps but resolve them intelligently
+        
+        # Top Picks Near You (4.7+ stars with 25+ reviews) - highest quality
+        if rating >= 4.7 and reviews >= 25:
+            place_data['isTopPick'] = True
+            
+        # Trending (4.4-4.9 rating with any review count) - sorted by review count later
+        if rating >= 4.4 and rating <= 4.9:
+            place_data['isTrending'] = True
+            
+        # Hidden Gems (4.3-4.6 with 5-30 reviews) - good but lesser known
+        if rating >= 4.3 and rating <= 4.6 and reviews >= 5 and reviews <= 30:
+            place_data['isHiddenGem'] = True
+            
+        # Local Parent Favorites (4.5+ with 40+ reviews) - community endorsed
+        if rating >= 4.5 and reviews >= 40:
+            place_data['isLocalFavorite'] = True
+        
+        # Priority-based overlap resolution: if a place qualifies for multiple categories,
+        # assign it to the most exclusive one to ensure good distribution
+        categories_qualified = []
+        if place_data['isTopPick']:
+            categories_qualified.append('topPick')
+        if place_data['isTrending']:
+            categories_qualified.append('trending')
+        if place_data['isHiddenGem']:
+            categories_qualified.append('hiddenGem')
+        if place_data['isLocalFavorite']:
+            categories_qualified.append('localFavorite')
+            
+        # If qualifies for multiple, assign to highest priority (most exclusive)
+        if len(categories_qualified) > 1:
+            # Priority order: TopPick > LocalFavorite > HiddenGem > Trending
+            if 'topPick' in categories_qualified:
+                place_data['isTrending'] = False
+                place_data['isHiddenGem'] = False
+                place_data['isLocalFavorite'] = False
+            elif 'localFavorite' in categories_qualified:
+                place_data['isTrending'] = False
+                place_data['isHiddenGem'] = False
+            elif 'hiddenGem' in categories_qualified:
+                place_data['isTrending'] = False
+        
+        print(f"Place {place_data.get('title', 'Unknown')}: Rating={rating}, Reviews={reviews}, "
+              f"TopPick={place_data['isTopPick']}, LocalFav={place_data['isLocalFavorite']}, "
+              f"HiddenGem={place_data['isHiddenGem']}, Trending={place_data['isTrending']}")
+
+    async def async_main(self, params, filters, min_price, max_price, queries=None):
         async with aiohttp.ClientSession() as session:
             # 1. Fetch initial place data from API
             print("Fetching initial place data from API...")
-            api_results = await self.async_fetch_all_places(params, session)
+            api_results = await self.async_fetch_all_places(params, session, max_results=60, queries=queries)
             if not api_results:
                 return []
 
@@ -1520,7 +1643,7 @@ class PlacesAPIView(APIView):
         print(f"Total unique results after pagination: {len(unique_results)}")
 
         if TESTING:
-            unique_results = unique_results[:15]
+            unique_results = unique_results[:100]
 
         def distance_between(lat1, lon1, lat2_lon2, lon2=None):
             """Calculate distance between two coordinates using haversine formula"""
@@ -2732,7 +2855,8 @@ class RecommendedPlacesAPIView(APIView):
             zip_code = data.get("zip_code")
             latitude = data.get("latitude", 40.712776)
             longitude = data.get("longitude", -74.005974)
-            radius = data.get("radius", 500)
+            radius_miles = data.get("radius", 25)  # Frontend sends miles
+            radius = radius_miles * 1609.34  # Convert miles to meters for internal use
             force_refresh = data.get("force_refresh", False)
             is_homebase = data.get("is_homebase", False)  # Flag to indicate this is a homebase update
             
@@ -3623,7 +3747,8 @@ class BatchRecommendationProcessingAPIView(APIView):
             zip_code = data.get("zip_code")
             latitude = data.get("latitude", 40.712776)
             longitude = data.get("longitude", -74.005974)
-            radius = data.get("radius", 500)
+            radius_miles = data.get("radius", 25)  # Frontend sends miles
+            radius = radius_miles * 1609.34  # Convert miles to meters for internal use
             force_refresh = data.get("force_refresh", False)
             
             # Get coordinates from zip if provided
