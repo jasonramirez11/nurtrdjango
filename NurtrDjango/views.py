@@ -517,8 +517,21 @@ def process_images_for_place(place, min_images=1):
         )
         
         if existing_image_links and len(existing_image_links) >= min_images:
-            print(f"Using existing images for place ID {place_id}")
-            return existing_image_links
+            # Validate existing images before using them
+            api_view = PlacesAPIView()  # Create instance to access validation method
+            valid_image_links = []
+            for image_url in existing_image_links:
+                if api_view.is_valid_gcs_url(image_url):
+                    valid_image_links.append(image_url)
+                else:
+                    print(f"Removing broken existing image URL for place {place_id}: {image_url}")
+            
+            # If we still have enough valid images, use them
+            if valid_image_links and len(valid_image_links) >= min_images:
+                print(f"Using {len(valid_image_links)} validated existing images for place ID {place_id}")
+                return valid_image_links
+            else:
+                print(f"Not enough valid existing images for place ID {place_id} ({len(valid_image_links)} valid, need {min_images})")
             
         # Create temp directory if needed
         os.makedirs("temp_images", exist_ok=True)
@@ -758,6 +771,22 @@ class PlacesAPIView(APIView):
                         "category": place.category,  # Include category in response
                         # Add other fields from the model as needed
                     }
+                    
+                    # Validate cached images and remove broken ones
+                    if place_data["place_images"]:
+                        valid_images = []
+                        for image_url in place_data["place_images"]:
+                            if self.is_valid_gcs_url(image_url):
+                                valid_images.append(image_url)
+                            else:
+                                print(f"Removing broken image URL for place {place.place_id}: {image_url}")
+                        place_data["place_images"] = valid_images
+                        
+                        # If no valid images remain, this place needs image processing
+                        if not valid_images:
+                            print(f"All cached images invalid for place {place.place_id}, needs reprocessing")
+                            # For popular searches, we'll handle this in the deferred processing
+                            # For regular searches, we'd need to add to places_needing_images
                     # Calculate distance using DB coordinates and request location
                     db_lat = float(place.latitude) if place.latitude is not None else None
                     db_lon = float(place.longitude) if place.longitude is not None else None
