@@ -630,15 +630,7 @@ class PlacesAPIView(APIView):
         #print('places request ', request.data)
         print('user is authenticated', request.data.get('is_authenticated', False))
 
-        # Rate limiting for unauthenticated users
-        if not request.data.get('is_authenticated', False):
-            rate_limit_response = self.check_rate_limit(
-                request,
-                MAX_UNAUTHENTICATED_REQUESTS_PER_IP,
-                CACHE_TIMEOUT_SECONDS
-            )
-            if rate_limit_response:
-                return rate_limit_response
+        # Rate limiting disabled for places search - no authentication required
 
         data = request.data
         zip_code = data.get("zip_code")  # Get ZIP code if provided
