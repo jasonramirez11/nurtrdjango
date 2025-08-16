@@ -314,7 +314,6 @@ def check_existing_images(bucket_name: str, place_id: str, max_retries: int = 3)
     
     for attempt in range(max_retries + 1):
         try:
-            storage_client = Client()
             bucket = storage_client.bucket(bucket_name)
             prefix = f"places/{place_id}/"
             
@@ -633,7 +632,19 @@ class PlacesAPIView(APIView):
         latitude = data.get("latitude", 40.712776)
         longitude = data.get("longitude", -74.005974)
         radius_miles = data.get("radius", 25)  # Frontend sends miles
-        radius = radius_miles * 1609.34  # Convert miles to meters for internal use
+        
+        # Debug: Log the raw radius value received
+        print(f"🔍 DEBUG - Raw radius received from frontend: {radius_miles}")
+        print(f"🔍 DEBUG - Raw radius type: {type(radius_miles)}")
+        
+        # Check if radius might already be in meters (double conversion prevention)
+        if radius_miles > 100:  # If radius > 100, likely already in meters
+            print(f"⚠️ WARNING - Radius appears to already be in meters: {radius_miles}")
+            print(f"⚠️ Converting from meters back to miles: {radius_miles / 1609.34}")
+            radius = radius_miles  # Use as-is since it's already in meters
+        else:
+            print(f"✅ Converting radius from miles to meters: {radius_miles} miles → {radius_miles * 1609.34} meters")
+            radius = radius_miles * 1609.34  # Convert miles to meters for internal use
         types = data.get("types", {})
         category = data.get("category", "")  # Get category for special handling
         min_price = data.get("minPrice", 0)
@@ -680,7 +691,8 @@ class PlacesAPIView(APIView):
             queries = None
             
         # Run asynchronous I/O to get place details from external API
-        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries))
+        # Skip image processing for popular searches initially
+        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries, is_popular_category, skip_images=is_popular_category))
 
         processed_results = [] # List to store final results (from DB or API)
 
@@ -842,9 +854,37 @@ class PlacesAPIView(APIView):
             # Recombine results with sorted trending places
             processed_results = trending_places + non_trending_places
         
-        # Limit results for non-popular searches when TESTING is True
+        # Limit results after category filtering and sorting
         if TESTING and not is_popular_category:
             processed_results = processed_results[:10]
+        elif is_popular_category:
+            # Randomize before capping to ensure fair category distribution
+            import random
+            random.shuffle(processed_results)
+            processed_results = processed_results[:100]
+            
+            # Now process images for just the top 100 popular places
+            places_needing_images = [p for p in processed_results if not p.get("imagePlaces")]
+            if places_needing_images:
+                print(f"Processing images for final {len(places_needing_images)} popular places...")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    future_to_place = {
+                        executor.submit(process_images_for_place, place): place
+                        for place in places_needing_images
+                    }
+                    
+                    for future in as_completed(future_to_place):
+                        place = future_to_place[future]
+                        try:
+                            processed_urls = future.result()
+                            if processed_urls:
+                                place["imagePlaces"] = processed_urls
+                            else:
+                                place["imagePlaces"] = []
+                        except Exception as e:
+                            print(f"Error processing images for place {place.get('place_id')}: {e}")
+                            place["imagePlaces"] = []
         
         total_results = len(processed_results) # Use count from processed list
         paginated_results = processed_results # For now, returning all processed results
@@ -858,7 +898,7 @@ class PlacesAPIView(APIView):
         }, status=HTTP_200_OK)
 
     def get_enhanced_kids_queries(self):
-        """Enhanced search queries for kids places when Popular category is requested (optimized to 8 queries)"""
+        """Enhanced search queries for kids places when Popular category is requested (optimized to 16 queries)"""
         return [
             "kids playground family fun center indoor outdoor play",
             "children museum interactive exhibits art classes creative activities",
@@ -867,7 +907,15 @@ class PlacesAPIView(APIView):
             "family restaurants kids menu playground dining food",
             "petting zoo farm animals kids nature outdoor wildlife",
             "kids dance music lessons library story time educational",
-            "family bowling laser tag activities arcade games entertainment"
+            "family bowling laser tag activities arcade games entertainment",
+            "kids swimming pools water parks splash pads aquatic centers",
+            "children theater performances shows drama classes acting",
+            "kids soccer baseball basketball sports leagues teams",
+            "family hiking trails nature walks outdoor adventures",
+            "kids science centers STEM learning hands-on experiments",
+            "children art studios pottery painting creative workshops",
+            "family mini golf go-karts amusement parks rides",
+            "kids trampoline parks bounce houses jump zones indoor"
         ]
     
     def add_popular_category_flags(self, place_data):
@@ -937,11 +985,13 @@ class PlacesAPIView(APIView):
               f"TopPick={place_data['isTopPick']}, LocalFav={place_data['isLocalFavorite']}, "
               f"HiddenGem={place_data['isHiddenGem']}, Trending={place_data['isTrending']}")
 
-    async def async_main(self, params, filters, min_price, max_price, queries=None):
+    async def async_main(self, params, filters, min_price, max_price, queries=None, is_popular_category=False, skip_images=False):
         async with aiohttp.ClientSession() as session:
             # 1. Fetch initial place data from API
             print("Fetching initial place data from API...")
-            api_results = await self.async_fetch_all_places(params, session, max_results=60, queries=queries)
+            # Use higher max_results for popular searches to avoid bottlenecks
+            max_results_param = 320 if is_popular_category else 60
+            api_results = await self.async_fetch_all_places(params, session, max_results=max_results_param, queries=queries, is_popular_category=is_popular_category)
             if not api_results:
                 return []
 
@@ -1037,9 +1087,15 @@ class PlacesAPIView(APIView):
                     api_result["source"] = "api"
                     places_needing_images.append(api_result)
 
-            # 7. Process images only for places that need them
-            print(f"Processing images for {len(places_needing_images)} places...")
-            if places_needing_images:
+            # 7. Process images only for places that need them (skip for popular searches initially)
+            if skip_images:
+                print(f"Skipping image processing for {len(places_needing_images)} places (will process after filtering)")
+                # Add places without images to results for now
+                for place in places_needing_images:
+                    place["imagePlaces"] = []
+                    processed_results.append(place)
+            elif places_needing_images:
+                print(f"Processing images for {len(places_needing_images)} places...")
                 start_time = time.time()
                 with ThreadPoolExecutor(max_workers=20) as executor:
                     # Map place to future for easy lookup after completion
@@ -1134,11 +1190,16 @@ class PlacesAPIView(APIView):
                 execution_time = round((end_time - start_time) * 1000, 2)
                 print(f"Finished processing images. Execution time: {execution_time} ms")
 
-            # 8. Filter results to places with images
-            final_results = [p for p in processed_results if p.get("imagePlaces", [])]
-            print(f"Returning {len(final_results)} places with images")
-
-            return final_results
+            # 8. Filter results to places with images (or skip filter for popular searches with deferred image processing)
+            if skip_images:
+                # For popular searches, return all results since image processing happens later
+                print(f"Returning {len(processed_results)} places (images will be processed after filtering)")
+                return processed_results
+            else:
+                # For regular searches, filter to places with images
+                final_results = [p for p in processed_results if p.get("imagePlaces", [])]
+                print(f"Returning {len(final_results)} places with images")
+                return final_results
 
     async def async_fetch_place_details(self, place_id, session):
         """Fetch individual place details asynchronously. Checks DB first."""
@@ -1492,8 +1553,10 @@ class PlacesAPIView(APIView):
         print(f"  - Description: {description[:100]}{'...' if len(description) > 100 else ''}")
         print(f"  - Rating: {place_details.get('rating', 'N/A')}")
         print(f"  - Hours: {place_details.get('hours', 'N/A')}")
-        print(f"  - Popular times: {len(place_details.get('popular_times', []))} entries")
-        print(f"  - Reviews list: {len(place_details.get('reviews_list', []))} reviews")
+        popular_times = place_details.get('popular_times', []) or []
+        reviews_list = place_details.get('reviews_list', []) or []
+        print(f"  - Popular times: {len(popular_times)} entries")
+        print(f"  - Reviews list: {len(reviews_list)} reviews")
         print(f"  - Address: {place_details.get('address', 'N/A')}")
         print(f"  - Formatted address: {place_details.get('formattedAddress', 'N/A')}")
         print(f"  - Types: {place_details.get('types', [])}")
@@ -1506,7 +1569,7 @@ class PlacesAPIView(APIView):
 
         return Response(place_details, status=HTTP_200_OK)
 
-    async def async_fetch_all_places(self, params, session, max_results=60, queries=None):
+    async def async_fetch_all_places(self, params, session, max_results=60, queries=None, is_popular_category=False):
         """Fetches all places asynchronously using the new Places API v2."""
 
         radius = params["radius"]
@@ -1601,7 +1664,11 @@ class PlacesAPIView(APIView):
         all_api_results = []
 
         if queries:
-            num_workers = min(len(queries), 5)
+            # Use more workers for popular searches since they're predefined and optimized
+            if is_popular_category:
+                num_workers = min(len(queries), 16)
+            else:
+                num_workers = min(len(queries), 5)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
                 
@@ -1643,7 +1710,11 @@ class PlacesAPIView(APIView):
         print(f"Total unique results after pagination: {len(unique_results)}")
 
         if TESTING:
-            unique_results = unique_results[:100]
+            # Higher limit for popular searches to get more comprehensive results
+            if is_popular_category:
+                unique_results = unique_results[:320]
+            else:
+                unique_results = unique_results[:100]
 
         def distance_between(lat1, lon1, lat2_lon2, lon2=None):
             """Calculate distance between two coordinates using haversine formula"""
