@@ -356,7 +356,7 @@ def get_images_from_serp(place_image_link, max_images=1):
 
         params = {'api_key': api_key}
 
-        response = requests.get(place_image_link, params=params)
+        response = requests.get(place_image_link, params=params, timeout=10)  # 10 second timeout for SERP API
 
         if response.status_code == 200:
             data = response.json()
@@ -600,7 +600,7 @@ class PlacesAPIView(APIView):
         
         try:
             import requests
-            response = requests.head(url, timeout=5)
+            response = requests.head(url, timeout=3)  # Reduced to 3 seconds for image validation
             return response.status_code == 200
         except Exception as e:
             print(f"URL validation failed for {url}: {e}")
@@ -630,7 +630,18 @@ class PlacesAPIView(APIView):
         #print('places request ', request.data)
         print('user is authenticated', request.data.get('is_authenticated', False))
 
-        # Rate limiting disabled for places search - no authentication required
+        # Check if user is authenticated
+        is_authenticated = request.data.get('is_authenticated', False)
+        
+        # Apply rate limiting for unauthenticated users
+        if not is_authenticated:
+            rate_limit_response = self.check_rate_limit(
+                request, 
+                MAX_UNAUTHENTICATED_REQUESTS_PER_IP, 
+                CACHE_TIMEOUT_SECONDS
+            )
+            if rate_limit_response:
+                return rate_limit_response
 
         data = request.data
         zip_code = data.get("zip_code")  # Get ZIP code if provided
@@ -919,7 +930,7 @@ class PlacesAPIView(APIView):
         }, status=HTTP_200_OK)
 
     def get_enhanced_kids_queries(self):
-        """Enhanced search queries for kids places when Popular category is requested (optimized to 16 queries)"""
+        """Enhanced search queries for kids places when Popular category is requested (optimized to 12 queries)"""
         return [
             "kids playground family fun center indoor outdoor play",
             "children museum interactive exhibits art classes creative activities",
@@ -932,11 +943,7 @@ class PlacesAPIView(APIView):
             "kids swimming pools water parks splash pads aquatic centers",
             "children theater performances shows drama classes acting",
             "kids soccer baseball basketball sports leagues teams",
-            "family hiking trails nature walks outdoor adventures",
-            "kids science centers STEM learning hands-on experiments",
-            "children art studios pottery painting creative workshops",
-            "family mini golf go-karts amusement parks rides",
-            "kids trampoline parks bounce houses jump zones indoor"
+            "family hiking trails nature walks outdoor adventures"
         ]
     
     def add_popular_category_flags(self, place_data):
@@ -1890,7 +1897,7 @@ class PlacesAPIView(APIView):
         if not country:
             try:
                 url = f"https://ipinfo.io/json?token={IP_INFO_API_TOKEN}"
-                response = requests.get(url)
+                response = requests.get(url, timeout=5)  # 5 second timeout
                 print(f"IP info response: {response.json()}")
                 if response.status_code == 200:
                     data = response.json()
