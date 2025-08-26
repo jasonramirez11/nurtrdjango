@@ -652,7 +652,7 @@ class PlacesAPIView(APIView):
 
     def is_in_populated_area(self, latitude, longitude, zip_code=None):
         """Check if the given coordinates are in a populated ZIP code area (database-only search eligible)."""
-        tolerance = 0.05  # Larger tolerance for ZIP code areas (covers ~3-5 miles)
+        tolerance = 0.20  # Increased tolerance for ZIP code areas (covers ~15-20 miles)
         
         # If ZIP code is provided, check direct match first
         if zip_code and zip_code in POPULATED_ZIP_CODES:
