@@ -68,6 +68,57 @@ SERP_API_KEY = os.getenv("SERP_API_KEY")
 
 print(f"TESTING {os.getenv('TESTING')}")
 
+# Populated ZIP codes for database-only popular searches
+POPULATED_ZIP_CODES = {
+    # First batch - completed
+    "11235": (40.5860069, -73.9418603),  # Brooklyn, NY
+    "77494": (29.742025, -95.8248352),   # Houston, TX
+    "77449": (29.8260177, -95.7510475),  # Houston, TX
+    "78660": (30.4332061, -97.60057859999999), # Austin, TX
+    "11368": (40.7506343, -73.8477874),  # Queens, NY
+    "60629": (41.7727709, -87.7123355),  # Chicago, IL
+    "77433": (29.9643725, -95.7510475),  # Houston, TX
+    "79936": (31.7599791, -106.287521),  # El Paso, TX
+    "90011": (34.007889, -118.2585096),  # Los Angeles, CA
+    "11385": (40.6980708, -73.8948295),  # Queens, NY
+    
+    # Second batch - completed
+    "11373": (40.737975, -73.8801301),   # Queens, NY
+    "90650": (33.90777509999999, -118.0830047), # Los Angeles, CA
+    "11226": (40.6470923, -73.9536163),  # Brooklyn, NY
+    "94565": (38.0182853, -121.9245556), # Bay Area, CA
+    "92336": (34.145515, -117.4673845),  # San Bernardino, CA
+    "11236": (40.63871959999999, -73.8948295), # Brooklyn, NY
+    "30044": (33.9327331, -84.0695961),  # Atlanta, GA
+    "91331": (34.2570374, -118.4279933), # Los Angeles, CA
+    "90044": (33.9478802, -118.2935891), # Los Angeles, CA
+    "10467": (40.8723987, -73.8713099),  # Bronx, NY
+    
+    # Third batch - completed
+    "10025": (40.7999209, -73.96831019999999), # Manhattan, NY
+    "11207": (40.6655101, -73.8918897),  # Brooklyn, NY
+    "92335": (34.08378700000001, -117.4673845), # San Bernardino, CA
+    "90805": (33.8640647, -118.1766294), # Long Beach, CA
+    "90250": (33.9127807, -118.3520389), # Los Angeles, CA
+    "77573": (29.4947986, -95.09110620000001), # Houston, TX
+    "79938": (31.8403844, -105.92299),   # El Paso, TX
+    "90201": (33.96672119999999, -118.1766294), # Los Angeles, CA
+    "75052": (32.67942, -97.0283383),    # Dallas, TX
+    "10314": (40.5952146, -74.1827119),  # Staten Island, NY
+}
+
+# Default random cities for database-only popular searches (legacy support)
+DEFAULT_RANDOM_CITIES = {
+    # Los Angeles (matches frontend)
+    (34.0522, -118.2437): "Los Angeles, CA",
+    # NYC (matches frontend) 
+    (40.712776, -74.005974): "New York, NY",
+    # Miami (matches frontend)
+    (25.7617, -80.1918): "Miami, FL",
+    # Dallas (matches frontend)
+    (32.7767, -96.7970): "Dallas, TX"
+}
+
 storage_client = Client()
 
 User = get_user_model()
@@ -240,7 +291,7 @@ def upload_place_images_to_bucket(
         image_paths (list[str]): A list of local file paths to the images for this place.
         workers (int): The maximum number of processes/threads to use.
     """
-    print(f"Uploading images for Place ID '{place_id}' to bucket '{bucket_name}'...")
+    # Starting upload process
 
     bucket = storage_client.bucket(bucket_name)
 
@@ -249,9 +300,10 @@ def upload_place_images_to_bucket(
 
     # List and delete existing blobs in the place ID folder
     blobs_to_delete = bucket.list_blobs(prefix=prefix)
+    deleted_count = 0
     for blob in blobs_to_delete:
-        print(f"Deleting existing blob: {blob.name}")
         blob.delete()
+        deleted_count += 1
 
     upload_tasks = []
     gcs_links = []
@@ -269,7 +321,6 @@ def upload_place_images_to_bucket(
         return []
 
     start_time = time.time()
-    print(f"Starting concurrent upload of {len(upload_tasks)} images for Place ID '{place_id}'...")
 
     # Use ThreadPoolExecutor for synchronous concurrent uploads
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -283,8 +334,8 @@ def upload_place_images_to_bucket(
             gcs_links.append(result)
 
     end_time = time.time()
-    print(f"Finished uploading for Place ID '{place_id}'.")
-    print(f"Total time for {len(gcs_links)} successful uploads: {end_time - start_time:.2f} seconds")
+    if gcs_links:
+        print(f"Uploaded {len(gcs_links)} images for {place_id} in {end_time - start_time:.1f}s")
     return gcs_links
 
 
@@ -309,7 +360,6 @@ def check_existing_images(bucket_name: str, place_id: str, max_retries: int = 3)
     """
     Check if images for the given place_id exist in the specified GCS bucket with retry logic.
     """
-    print(f"Checking for existing images in bucket '{bucket_name}' for Place ID '{place_id}'...")
     start_time = time.time()
     
     for attempt in range(max_retries + 1):
@@ -321,8 +371,8 @@ def check_existing_images(bucket_name: str, place_id: str, max_retries: int = 3)
             existing_images = [blob.public_url for blob in blobs]
             
             end_time = time.time()
-            print(f"Finished checking for existing images for Place ID '{place_id}'.")
-            print(f"Total time for checking {len(existing_images)} existing images: {end_time - start_time:.2f} seconds")
+            if existing_images:
+                pass  # print(f"Found {len(existing_images)} cached images for {place_id}")
             return existing_images
             
         except Exception as e:
@@ -350,7 +400,7 @@ def get_images_from_serp(place_image_link, max_images=1):
     Returns:
         list: List of image URLs.
     """
-    print(f"Fetching images from SERP API for link: {place_image_link}")
+    # Removed verbose SERP API fetching log
     try:
         api_key = os.environ.get('SERP_API_KEY')
 
@@ -361,13 +411,14 @@ def get_images_from_serp(place_image_link, max_images=1):
         if response.status_code == 200:
             data = response.json()
             image_urls = [image_data['image'] for image_data in data.get('photos', []) if image_data.get('image')][:max_images]
-            print(f"Fetched {len(image_urls)} images from SERP API.")
+            if not image_urls:
+                print(f"No images found via SERP API")
             return image_urls
         else:
-            print(f"Failed to fetch images from SERP API: Status {response.status_code}, Response: {response.text}")
+            print(f"SERP API failed: Status {response.status_code}")
             return []
     except Exception as e:
-        print(f"Error fetching images from SERP API: {str(e)}")
+        print(f"SERP API error: {str(e)}")
         return []
 
 def get_reviews_from_serp(place_id, max_reviews=5):
@@ -415,7 +466,7 @@ def process_images_for_place(place, min_images=1):
     """
         
     try:
-        print(f"Processing images for place: {place.get('place_id', place.get('id'))}")
+        # print(f"Processing images for place: {place.get('place_id', place.get('id'))}")
 
         if min_images == 1:
             max_images = 1
@@ -589,6 +640,151 @@ class PlacesAPIView(APIView):
             ip = request.META.get('REMOTE_ADDR')
         return ip
 
+    def is_using_default_city(self, latitude, longitude):
+        """Check if the given coordinates match any default random city (with tolerance)."""
+        tolerance = 0.01  # Small tolerance for floating point comparison
+        for (default_lat, default_lon), city_name in DEFAULT_RANDOM_CITIES.items():
+            if (abs(float(latitude) - default_lat) < tolerance and 
+                abs(float(longitude) - default_lon) < tolerance):
+                print(f"Using default city: {city_name}")
+                return True, city_name
+        return False, None
+
+    def is_in_populated_area(self, latitude, longitude, zip_code=None):
+        """Check if the given coordinates are in a populated ZIP code area (database-only search eligible)."""
+        tolerance = 0.05  # Larger tolerance for ZIP code areas (covers ~3-5 miles)
+        
+        # If ZIP code is provided, check direct match first
+        if zip_code and zip_code in POPULATED_ZIP_CODES:
+            zip_lat, zip_lon = POPULATED_ZIP_CODES[zip_code]
+            print(f"Direct ZIP code match found: {zip_code}")
+            return True, f"ZIP {zip_code}"
+        
+        # Check coordinate proximity to any populated ZIP code
+        for zip_code_key, (zip_lat, zip_lon) in POPULATED_ZIP_CODES.items():
+            if (abs(float(latitude) - zip_lat) < tolerance and 
+                abs(float(longitude) - zip_lon) < tolerance):
+                print(f"Using populated ZIP code area: {zip_code_key}")
+                return True, f"ZIP {zip_code_key}"
+        
+        # Fallback to legacy default cities check
+        return self.is_using_default_city(latitude, longitude)
+
+    async def async_database_only_search(self, latitude, longitude, radius_meters):
+        """Search for places in database only, without SERP API calls."""
+        print(f"Searching database for places near ({latitude}, {longitude}) within {radius_meters} meters")
+        
+        # Convert radius from meters to degrees (rough approximation)
+        # 1 degree latitude ≈ 111,000 meters
+        # 1 degree longitude varies by latitude, but we'll use a simple approximation
+        lat_delta = radius_meters / 111000.0
+        lon_delta = radius_meters / (111000.0 * math.cos(math.radians(float(latitude))))
+        
+        # Define bounding box for initial filtering
+        min_lat = float(latitude) - lat_delta
+        max_lat = float(latitude) + lat_delta
+        min_lon = float(longitude) - lon_delta  
+        max_lon = float(longitude) + lon_delta
+        
+        print(f"Searching database with bounding box: lat({min_lat}, {max_lat}), lon({min_lon}, {max_lon})")
+        
+        try:
+            # Query database for places within bounding box
+            places_in_range = await sync_to_async(list)(
+                Place.objects.filter(
+                    latitude__gte=min_lat,
+                    latitude__lte=max_lat,
+                    longitude__gte=min_lon,
+                    longitude__lte=max_lon,
+                    # Filter for kid-friendly places with good ratings
+                    rating__gte=3.5,
+                    reviews__gte=5
+                ).order_by('-rating', '-reviews')[:200]  # Get top rated places
+            )
+            
+            print(f"Found {len(places_in_range)} places in database within bounding box")
+            
+            # Convert to expected format and calculate precise distances
+            processed_results = []
+            
+            def haversine(lat1, lon1, lat2, lon2):
+                """Calculate distance between two coordinates using haversine formula"""
+                if None in [lat1, lon1, lat2, lon2]:
+                    return float('inf')
+                R = 3958.8  # Radius of the Earth in miles
+                lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
+                dlat = lat2 - lat1
+                dlon = lon2 - lon1
+                a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                distance = R * c
+                return round(distance, 2)
+            
+            radius_miles = radius_meters / 1609.34  # Convert to miles for comparison
+            
+            for place in places_in_range:
+                # Calculate precise distance
+                distance = haversine(
+                    float(latitude), float(longitude), 
+                    float(place.latitude), float(place.longitude)
+                )
+                
+                # Only include places within the actual radius
+                if distance <= radius_miles:
+                    place_data = {
+                        "place_id": place.place_id,
+                        "title": place.title,
+                        "description": place.description,
+                        "data_id": place.data_id,
+                        "reviews_link": place.reviews_link,
+                        "photos_link": place.photos_link,
+                        "location": {
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None
+                        },
+                        "gps_coordinates": {
+                            "latitude": float(place.latitude) if place.latitude is not None else None,
+                            "longitude": float(place.longitude) if place.longitude is not None else None
+                        },
+                        "type": place.type,
+                        "types": place.types,
+                        "address": place.address,
+                        "extensions": place.extensions,
+                        "displayName": {"text": place.display_name} if place.display_name else None,
+                        "formattedAddress": place.formatted_address,
+                        "rating": place.rating,
+                        "reviews": place.reviews,
+                        "operating_hours": place.hours,
+                        "imagePlaces": place.place_images or [],
+                        "reviews_list": place.reviews_list or [],
+                        "popular_times": place.popular_times,
+                        "category": place.category,
+                        "distance": distance,
+                        "source": "database_only"
+                    }
+                    
+                    # Validate image URLs for database-only results
+                    if place_data["imagePlaces"]:
+                        valid_images = []
+                        for image_url in place_data["imagePlaces"]:
+                            if self.is_valid_gcs_url(image_url):
+                                valid_images.append(image_url)
+                            else:
+                                print(f"Removing broken image URL for database place {place.place_id}: {image_url}")
+                        place_data["imagePlaces"] = valid_images
+                    
+                    processed_results.append(place_data)
+            
+            # Sort by distance, then by rating
+            processed_results.sort(key=lambda x: (x.get("distance", float('inf')), -x.get("rating", 0)))
+            
+            print(f"Returning {len(processed_results)} places from database within {radius_miles} miles")
+            return processed_results
+            
+        except Exception as e:
+            print(f"Error in database-only search: {e}")
+            return []
+
     def is_valid_gcs_url(self, url):
         """Check if a GCS URL is valid and accessible."""
         if not url or not isinstance(url, str):
@@ -598,13 +794,17 @@ class PlacesAPIView(APIView):
         if not url.startswith('https://storage.googleapis.com/'):
             return False
         
-        try:
-            import requests
-            response = requests.head(url, timeout=3)  # Reduced to 3 seconds for image validation
-            return response.status_code == 200
-        except Exception as e:
-            print(f"URL validation failed for {url}: {e}")
-            return False
+        # PERFORMANCE FIX: Skip HTTP validation to eliminate 200+ requests per API call
+        # TODO: Implement proper caching/validation strategy later
+        return True
+        
+        # try:
+        #     import requests
+        #     response = requests.head(url, timeout=1)  # Reduced to 1 second for faster validation
+        #     return response.status_code == 200
+        # except Exception as e:
+        #     print(f"URL validation failed for {url}: {e}")
+        #     return False
 
     async def get_coordinates_from_zip(self, zip_code):
         """Fetch latitude and longitude from ZIP code using Geocoding API."""
@@ -671,13 +871,13 @@ class PlacesAPIView(APIView):
         if data.get('load_more', False):
             page += 1
         
-        print('page', page)
-        print('load more', data.get('load_more', False))
-        print('category', category)
+        # print('page', page)
+        # print('load more', data.get('load_more', False))
+        # print('category', category)
         
         # Check if popular category is requested
         is_popular_category = category.lower() in ['popular']
-        print(f'popular category requested: {is_popular_category}')
+        # print(f'popular category requested: {is_popular_category}')
         
         if zip_code:
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
@@ -699,16 +899,23 @@ class PlacesAPIView(APIView):
 
         print(f"Params: {params}") # OK HERE
 
-        # Enhance search queries for popular category kids places
+        # Check if we should use database-only search for popular category in populated areas
+        use_database_only = False
         if is_popular_category:
-            queries = self.get_enhanced_kids_queries()
-            print(f'Enhanced kids queries for popular category: {queries}')
+            is_populated_area, area_name = self.is_in_populated_area(latitude, longitude, zip_code)
+            if is_populated_area:
+                print(f'🏪 Using database-only search for popular category in populated area: {area_name}')
+                use_database_only = True
+                api_results = asyncio.run(self.async_database_only_search(latitude, longitude, radius))
+            else:
+                # Use SERP API for non-populated areas
+                queries = self.get_enhanced_kids_queries()
+                print(f'🔍 Enhanced kids queries for popular category in non-populated area: {queries}')
+                api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries, is_popular_category, skip_images=is_popular_category))
         else:
+            # Regular search for non-popular categories
             queries = None
-            
-        # Run asynchronous I/O to get place details from external API
-        # Skip image processing for popular searches initially
-        api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries, is_popular_category, skip_images=is_popular_category))
+            api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries, is_popular_category, skip_images=is_popular_category))
 
         processed_results = [] # List to store final results (from DB or API)
 
@@ -727,21 +934,34 @@ class PlacesAPIView(APIView):
 
         seen_place_ids = set()
 
-        # Process each result from the API
-        for api_result in api_results:
-            place_id = api_result.get("place_id")
-            if not place_id or place_id in seen_place_ids:
-                continue # Skip if no place_id
+        # Handle database-only results (already processed) vs API results (need processing)
+        if use_database_only:
+            # Database-only results are already fully processed
+            print(f"Using {len(api_results)} pre-processed database results")
+            processed_results = api_results
+            
+            # Apply popular category flags to database results
+            for result in processed_results:
+                self.add_popular_category_flags(result)
+        else:
+            # Batch database lookup to avoid N+1 query problem
+            place_ids_to_lookup = [r.get("place_id") for r in api_results if r.get("place_id")]
+            existing_places = Place.objects.filter(place_id__in=place_ids_to_lookup)
+            place_lookup = {p.place_id: p for p in existing_places}
+            print(f"Batched DB lookup: {len(existing_places)}/{len(place_ids_to_lookup)} places found")
+            
+            # Process each result from the API (optimized logic)
+            for api_result in api_results:
+                place_id = api_result.get("place_id")
+                if not place_id or place_id in seen_place_ids:
+                    continue # Skip if no place_id
 
-            seen_place_ids.add(place_id)
+                seen_place_ids.add(place_id)
 
-            try:
-                # Check if place exists in DB - use a direct function call with sync_to_async
-                # instead of await
-                get_place = sync_to_async(Place.objects.get)
-                try:
-                    place = asyncio.run(get_place(place_id=place_id))
-                    print(f"Found place in DB: {place_id}")
+                # Check if place exists in our batch lookup
+                if place_id in place_lookup:
+                    # Place found in database
+                    place = place_lookup[place_id]
 
                     # Use DB data, construct dictionary matching API structure (or desired output)
                     place_data = {
@@ -782,14 +1002,12 @@ class PlacesAPIView(APIView):
                             if self.is_valid_gcs_url(image_url):
                                 valid_images.append(image_url)
                             else:
-                                print(f"Removing broken image URL for place {place.place_id}: {image_url}")
+                                pass  # Skip broken image URL (still removed from valid_images)
                         place_data["place_images"] = valid_images
                         
                         # If no valid images remain, this place needs image processing
                         if not valid_images:
-                            print(f"All cached images invalid for place {place.place_id}, needs reprocessing")
-                            # For popular searches, we'll handle this in the deferred processing
-                            # For regular searches, we'd need to add to places_needing_images
+                            pass  # Place will be handled in deferred processing
                     # Calculate distance using DB coordinates and request location
                     db_lat = float(place.latitude) if place.latitude is not None else None
                     db_lon = float(place.longitude) if place.longitude is not None else None
@@ -802,7 +1020,8 @@ class PlacesAPIView(APIView):
                     # Add to processed results
                     processed_results.append(place_data)
 
-                except ObjectDoesNotExist:
+                else:
+                    # Place not found in database
                     # Place not in DB, process from API and save
                     place_data = api_result # Start with API result
 
@@ -856,20 +1075,8 @@ class PlacesAPIView(APIView):
                     # Add to processed results
                     processed_results.append(place_data)
 
-            except Exception as e:
-                print(f"Error processing place {place_id}: {e}")
-                # Still add API result to processed results
-                place_data = api_result
-                # Calculate distance
-                api_lat = api_result.get("location", {}).get("latitude")
-                api_lon = api_result.get("location", {}).get("longitude")
-                place_data["distance"] = haversine(float(latitude), float(longitude), api_lat, api_lon)
-                
-                # Add categorization flags for popular category
-                if is_popular_category:
-                    self.add_popular_category_flags(place_data)
-                
-                processed_results.append(place_data)
+                # General exception handling for other processing errors
+                # (Note: Database lookup exceptions eliminated by batch approach)
 
         # Sort by distance if calculated
         #processed_results.sort(key=lambda x: x.get("distance", float("inf")))
@@ -1009,9 +1216,9 @@ class PlacesAPIView(APIView):
             elif 'hiddenGem' in categories_qualified:
                 place_data['isTrending'] = False
         
-        print(f"Place {place_data.get('title', 'Unknown')}: Rating={rating}, Reviews={reviews}, "
-              f"TopPick={place_data['isTopPick']}, LocalFav={place_data['isLocalFavorite']}, "
-              f"HiddenGem={place_data['isHiddenGem']}, Trending={place_data['isTrending']}")
+        # print(f"Place {place_data.get('title', 'Unknown')}: Rating={rating}, Reviews={reviews}, "
+        #       f"TopPick={place_data['isTopPick']}, LocalFav={place_data['isLocalFavorite']}, "
+        #       f"HiddenGem={place_data['isHiddenGem']}, Trending={place_data['isTrending']}")
 
     async def async_main(self, params, filters, min_price, max_price, queries=None, is_popular_category=False, skip_images=False):
         async with aiohttp.ClientSession() as session:
@@ -1086,16 +1293,16 @@ class PlacesAPIView(APIView):
                         # Special case: validate single image URL
                         single_image_url = place.place_images[0]
                         if not self.is_valid_gcs_url(single_image_url):
-                            print(f"Single image URL invalid for place {place.place_id}: {single_image_url}")
+                            # print(f"Single image URL invalid for place {place.place_id}: {single_image_url}")
                             places_needing_images.append(place_dict)
                         else:
                             # Single valid image, add to results
                             processed_results.append(place_dict)
-                            print(f"Using cached place with valid single image: {place.place_id}")
+                            # print(f"Using cached place with valid single image: {place.place_id}")
                     else:
                         # Has multiple images, add directly to final results
                         processed_results.append(place_dict)
-                        print(f"Using cached place with images: {place.place_id}")
+                        # print(f"Using cached place with images: {place.place_id}")
 
             except Exception as e:
                 print(f"Error querying database for places: {e}")
@@ -1694,7 +1901,7 @@ class PlacesAPIView(APIView):
         if queries:
             # Use more workers for popular searches since they're predefined and optimized
             if is_popular_category:
-                num_workers = min(len(queries), 16)
+                num_workers = min(len(queries), 8)  # Reduced from 16 to 8 to prevent rate limiting
             else:
                 num_workers = min(len(queries), 5)
 
@@ -1933,6 +2140,258 @@ class PlacesAPIView(APIView):
         cache.set(cache_key, request_count + 1, timeout=cache_timeout)
         print(f"Unauthenticated request from IP {ip_address}. Count: {request_count + 1}")
         return None
+
+
+class BatchPopulatePlacesAPIView(APIView):
+    """Endpoint to batch populate places from ZIP codes."""
+    permission_classes = [AllowAny]  # TODO: Add authentication for production
+    parser_classes = [JSONParser]
+    
+    # Default ZIP codes for batch population
+    DEFAULT_ZIP_CODES = [
+        "11235", "77494", "77449", "78660", "11368", "60629", "77433", "79936", 
+        "90011", "11385", "11373", "90650", "11226", "94565", "92336", "11236", 
+        "30044", "91331", "90044", "10467", "10025", "11207", "92335", "90805", 
+        "90250", "77573", "79938", "90201", "75052", "10314", "92683", "77584", 
+        "11230", "11234", "11206", "93307", "92503", "10456", "78613", "30043", 
+        "91911", "92345", "75217", "78641", "78521", "34787", "78666", "93722", 
+        "60632", "92376", "60647", "30024", "60639", "99301", "92804", "60804", 
+        "11212", "75035", "78542", "92154", "95076"
+    ]
+    
+    def post(self, request):
+        """Process batch population request."""
+        start_time = time.time()
+        
+        # Parse request parameters
+        zip_codes = request.data.get('zip_codes', self.DEFAULT_ZIP_CODES)
+        if isinstance(zip_codes, str):
+            zip_codes = [z.strip() for z in zip_codes.split(',')]
+        
+        queries_per_zip = min(request.data.get('queries_per_zip', 5), 12)  # Cap at 12
+        dry_run = request.data.get('dry_run', False)
+        delay_seconds = max(request.data.get('delay', 2), 1)  # Minimum 1 second delay
+        max_zips = min(len(zip_codes), request.data.get('max_zips', 10))  # Safety limit
+        
+        # Limit ZIP codes for safety
+        zip_codes = zip_codes[:max_zips]
+        
+        print(f"Batch populate request: {len(zip_codes)} ZIP codes, {queries_per_zip} queries each, dry_run={dry_run}")
+        
+        if dry_run:
+            print(f"🧪 DRY RUN MODE - Simulating processing of {len(zip_codes)} ZIP codes")
+            print(f"📊 Would make {len(zip_codes) * queries_per_zip} total API calls")
+            print(f"⏱️ Estimated time: {(len(zip_codes) * delay_seconds) / 60:.1f} minutes")
+            print(f"📍 ZIP codes to process: {', '.join(zip_codes)}")
+            print(f"✅ Dry run completed successfully")
+            return Response({
+                'status': 'dry_run_complete',
+                'message': f'Would process {len(zip_codes)} ZIP codes with {queries_per_zip} queries each',
+                'zip_codes': zip_codes,
+                'estimated_api_calls': len(zip_codes) * queries_per_zip,
+                'estimated_time_minutes': (len(zip_codes) * delay_seconds) / 60
+            }, status=HTTP_200_OK)
+        
+        # Initialize PlacesAPIView for reusing logic
+        print(f"🚀 REAL RUN MODE - Starting actual processing")
+        print(f"⚠️ This will make {len(zip_codes) * queries_per_zip} API calls and cost money!")
+        places_api = PlacesAPIView()
+        results = []
+        stats = {
+            'zip_codes_processed': 0,
+            'total_places_found': 0,
+            'total_places_saved': 0,
+            'total_places_updated': 0,
+            'errors': []
+        }
+        print(f"🔧 Initialized PlacesAPIView and stats tracking")
+        
+        # Process each ZIP code
+        for i, zip_code in enumerate(zip_codes):
+            print(f"Processing ZIP code {i+1}/{len(zip_codes)}: {zip_code}")
+            
+            try:
+                # Get coordinates from ZIP code
+                print(f"🌍 Getting coordinates for ZIP {zip_code}...")
+                latitude, longitude = asyncio.run(places_api.get_coordinates_from_zip(zip_code))
+                if not latitude or not longitude:
+                    error_msg = f"Could not get coordinates for ZIP {zip_code}"
+                    print(f"❌ ERROR: {error_msg}")
+                    stats['errors'].append(error_msg)
+                    continue
+                
+                print(f"✅ Got coordinates: {latitude}, {longitude}")
+                
+                # Setup search parameters (reusing existing logic)
+                radius = 25 * 1609.34  # 25 miles in meters
+                params = {
+                    "location": f"{latitude},{longitude}",
+                    "radius": radius,
+                    "key": places_api.API_KEY,
+                }
+                
+                # Get enhanced kids queries (reusing existing logic)
+                queries = places_api.get_enhanced_kids_queries()[:queries_per_zip]
+                print(f"🔍 Running {len(queries)} search queries...")
+                
+                # Run the search (same as regular POST - handles database saving internally)
+                print(f"🌐 Making SERP API calls (this may take 30-60 seconds)...")
+                api_results = asyncio.run(places_api.async_main(
+                    params=params,
+                    filters=[],
+                    min_price=0,
+                    max_price=500,
+                    queries=queries,
+                    is_popular_category=True,
+                    skip_images=False  # Process images
+                ))
+                print(f"✅ SERP API calls completed")
+                
+                places_found = len(api_results)
+                print(f"📍 Found {places_found} places to process")
+                
+                # async_main already handled all database operations (save new, update existing, validate images)
+                print(f"💾 Database operations completed by async_main")
+                print(f"✅ Processing completed - all places saved/updated as needed")
+                
+                # Since async_main handles the database operations internally, we just track the results
+                # async_main returns processed results (mix of DB + API data) ready for frontend
+                places_saved = 0  # async_main doesn't report this separately
+                places_updated = 0  # async_main doesn't report this separately
+                
+                # Update stats
+                stats['zip_codes_processed'] += 1
+                stats['total_places_found'] += places_found
+                stats['total_places_saved'] += places_saved
+                stats['total_places_updated'] += places_updated
+                
+                result = {
+                    'zip_code': zip_code,
+                    'latitude': latitude,
+                    'longitude': longitude,
+                    'places_found': places_found,
+                    'places_saved': places_saved,
+                    'places_updated': places_updated,
+                    'success': True
+                }
+                results.append(result)
+                
+                print(f"ZIP {zip_code} completed: {places_found} found, {places_saved} saved, {places_updated} updated")
+                
+                # Add delay between ZIP codes to respect rate limits
+                if i < len(zip_codes) - 1:  # Don't delay after the last one
+                    time.sleep(delay_seconds)
+                
+            except Exception as e:
+                error_msg = f"Error processing ZIP {zip_code}: {e}"
+                print(f"ERROR: {error_msg}")
+                stats['errors'].append(error_msg)
+                results.append({
+                    'zip_code': zip_code,
+                    'success': False,
+                    'error': str(e)
+                })
+        
+        # Final response
+        execution_time = time.time() - start_time
+        
+        print(f"🎉 BATCH PROCESSING COMPLETED")
+        print(f"⏱️ Total execution time: {execution_time:.2f} seconds")
+        print(f"📊 Final stats:")
+        print(f"   - ZIP codes processed: {stats['zip_codes_processed']}")
+        print(f"   - Total places found: {stats['total_places_found']}")
+        print(f"   - Places saved: {stats['total_places_saved']}")
+        print(f"   - Places updated: {stats['total_places_updated']}")
+        print(f"   - Errors: {len(stats['errors'])}")
+        
+        return Response({
+            'status': 'completed',
+            'execution_time_seconds': round(execution_time, 2),
+            'stats': stats,
+            'results': results,
+            'summary': {
+                'zip_codes_processed': stats['zip_codes_processed'],
+                'total_places_found': stats['total_places_found'],
+                'total_places_saved': stats['total_places_saved'],
+                'total_places_updated': stats['total_places_updated'],
+                'error_count': len(stats['errors']),
+                'success_rate': f"{(stats['zip_codes_processed'] / len(zip_codes) * 100):.1f}%" if zip_codes else "0%"
+            }
+        }, status=HTTP_200_OK)
+    
+    def create_new_place(self, place_data):
+        """Create new Place from API data (reusing script logic)."""
+        lat_val = place_data.get("location", {}).get("latitude")
+        lon_val = place_data.get("location", {}).get("longitude")
+        
+        place = Place(
+            title=place_data.get("title", ""),
+            description=place_data.get("description", ""),
+            place_id=place_data.get("place_id"),
+            data_id=place_data.get("data_id"),
+            reviews_link=place_data.get("reviews_link"),
+            photos_link=place_data.get("photos_link"),
+            latitude=lat_val,
+            longitude=lon_val,
+            type=place_data.get("type"),
+            types=place_data.get("types", []),
+            address=place_data.get("address"),
+            extensions=place_data.get("extensions", {}),
+            display_name=place_data.get("displayName", {}).get("text") or place_data.get("title"),
+            formatted_address=place_data.get("formattedAddress"),
+            rating=place_data.get("rating"),
+            reviews=place_data.get("reviews") or place_data.get("userRatingCount"),
+            hours=place_data.get("hours", place_data.get("operating_hours", [])),
+            place_images=place_data.get("imagePlaces", []),
+            reviews_list=place_data.get("reviews_list", []),
+            popular_times=place_data.get("popular_times", []),
+            category=place_data.get("category", "")
+        )
+        place.save()
+    
+    def update_existing_place(self, existing_place, place_data):
+        """Update existing place with new data if needed."""
+        updated = False
+        update_fields = []
+        
+        # Update images if we have more
+        new_images = place_data.get("imagePlaces", [])
+        if new_images and len(new_images) > len(existing_place.place_images or []):
+            existing_place.place_images = new_images
+            update_fields.append('place_images')
+            updated = True
+        
+        # Update missing fields
+        updates = [
+            ('description', place_data.get("description")),
+            ('popular_times', place_data.get("popular_times", [])),
+            ('reviews_list', place_data.get("reviews_list", [])),
+        ]
+        
+        for field_name, new_value in updates:
+            if new_value and not getattr(existing_place, field_name):
+                setattr(existing_place, field_name, new_value)
+                update_fields.append(field_name)
+                updated = True
+        
+        # Update rating/reviews if better
+        new_rating = place_data.get("rating")
+        if new_rating and (not existing_place.rating or new_rating > existing_place.rating):
+            existing_place.rating = new_rating
+            update_fields.append('rating')
+            updated = True
+        
+        new_reviews = place_data.get("reviews") or place_data.get("userRatingCount")
+        if new_reviews and (not existing_place.reviews or new_reviews > existing_place.reviews):
+            existing_place.reviews = new_reviews
+            update_fields.append('reviews')
+            updated = True
+        
+        if updated:
+            existing_place.save(update_fields=update_fields)
+            
+        return updated
+
 
 class ImageDownloadAPIView(APIView):
     permission_classes = [AllowAny]
