@@ -105,6 +105,20 @@ POPULATED_ZIP_CODES = {
     "90201": (33.96672119999999, -118.1766294), # Los Angeles, CA
     "75052": (32.67942, -97.0283383),    # Dallas, TX
     "10314": (40.5952146, -74.1827119),  # Staten Island, NY
+    "33101": (25.7617, -80.1918),       # Miami, FL (downtown)
+    
+    # New Miami, Dallas, and Austin ZIP codes
+    "33109": (25.7560139, -80.1344842), # Miami Beach, FL
+    "33125": (25.7862401, -80.2349196), # Miami, FL (west)
+    "33156": (25.6579955, -80.2878794), # Miami, FL (south)
+    "75201": (32.788993, -96.7989312),  # Dallas, TX (downtown)
+    "75225": (32.8668443, -96.78687939999999), # Dallas, TX (north)
+    "75230": (32.9005121, -96.78687939999999), # Dallas, TX (north)
+    "75218": (32.837779, -96.7012424),  # Dallas, TX (east)
+    "78701": (30.2729209, -97.74438630000002), # Austin, TX (downtown)
+    "78704": (30.2377851, -97.77493030000001), # Austin, TX (south)
+    "78745": (30.2031735, -97.84301259999999), # Austin, TX (southwest)
+    "78750": (30.4135216, -97.80081570000001), # Austin, TX (northwest)
 }
 
 # Default random cities for database-only popular searches (legacy support)
@@ -654,21 +668,45 @@ class PlacesAPIView(APIView):
         """Check if the given coordinates are in a populated ZIP code area (database-only search eligible)."""
         tolerance = 0.25  # Increased tolerance for ZIP code areas to better cover Miami area
         
+        print(f"🏪 Checking populated area eligibility:")
+        print(f"   📍 Coordinates: ({latitude}, {longitude})")
+        print(f"   📮 ZIP code: {zip_code}")
+        print(f"   📏 Tolerance: {tolerance} degrees")
+        
         # If ZIP code is provided, check direct match first
-        if zip_code and zip_code in POPULATED_ZIP_CODES:
-            zip_lat, zip_lon = POPULATED_ZIP_CODES[zip_code]
-            print(f"Direct ZIP code match found: {zip_code}")
-            return True, f"ZIP {zip_code}"
+        if zip_code:
+            if zip_code in POPULATED_ZIP_CODES:
+                zip_lat, zip_lon = POPULATED_ZIP_CODES[zip_code]
+                print(f"   ✅ Direct ZIP code match found: {zip_code} → ({zip_lat}, {zip_lon})")
+                return True, f"ZIP {zip_code}"
+            else:
+                print(f"   ❌ ZIP code {zip_code} not in POPULATED_ZIP_CODES")
         
         # Check coordinate proximity to any populated ZIP code
+        print(f"   🔍 Checking coordinate proximity to {len(POPULATED_ZIP_CODES)} populated ZIP codes...")
+        closest_distance = float('inf')
+        closest_zip = None
+        
         for zip_code_key, (zip_lat, zip_lon) in POPULATED_ZIP_CODES.items():
-            if (abs(float(latitude) - zip_lat) < tolerance and 
-                abs(float(longitude) - zip_lon) < tolerance):
-                print(f"Using populated ZIP code area: {zip_code_key}")
+            lat_diff = abs(float(latitude) - zip_lat)
+            lon_diff = abs(float(longitude) - zip_lon)
+            distance = (lat_diff**2 + lon_diff**2)**0.5
+            
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_zip = zip_code_key
+            
+            if lat_diff < tolerance and lon_diff < tolerance:
+                print(f"   ✅ Coordinate match found: {zip_code_key} (distance: {distance:.4f} degrees)")
                 return True, f"ZIP {zip_code_key}"
         
+        print(f"   ❌ No coordinate matches within tolerance. Closest: {closest_zip} (distance: {closest_distance:.4f} degrees)")
+        
         # Fallback to legacy default cities check
-        return self.is_using_default_city(latitude, longitude)
+        print(f"   🔄 Falling back to legacy default cities check...")
+        result = self.is_using_default_city(latitude, longitude)
+        print(f"   🏛️ Legacy default cities result: {result}")
+        return result
 
     async def async_database_only_search(self, latitude, longitude, radius_meters):
         """Search for places in database only, without SERP API calls."""
@@ -875,16 +913,21 @@ class PlacesAPIView(APIView):
         if data.get('load_more', False):
             page += 1
         
-        # print('page', page)
-        # print('load more', data.get('load_more', False))
-        # print('category', category)
+        # Debug request parameters
+        print(f"🔍 Request Debug Info:")
+        print(f"   📍 ZIP code: {zip_code}")
+        print(f"   🏷️ Category: '{category}' (raw)")
+        print(f"   📄 Page: {page}")
+        print(f"   🔄 Load more: {data.get('load_more', False)}")
         
         # Check if popular category is requested
         is_popular_category = category.lower() in ['popular']
-        # print(f'popular category requested: {is_popular_category}')
+        print(f"   ⭐ Is popular category: {is_popular_category} ('{category}'.lower() in ['popular'])")
         
         if zip_code:
+            print(f"   🗺️ Getting coordinates for ZIP {zip_code}...")
             latitude, longitude = asyncio.run(self.get_coordinates_from_zip(zip_code))
+            print(f"   📍 Resolved coordinates: {latitude}, {longitude}")
             if not latitude or not longitude:
                 return Response({"error": "Invalid ZIP code or location not found"}, status=HTTP_400_BAD_REQUEST)
         
