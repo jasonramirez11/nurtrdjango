@@ -652,7 +652,7 @@ class PlacesAPIView(APIView):
 
     def is_in_populated_area(self, latitude, longitude, zip_code=None):
         """Check if the given coordinates are in a populated ZIP code area (database-only search eligible)."""
-        tolerance = 0.20  # Increased tolerance for ZIP code areas (covers ~15-20 miles)
+        tolerance = 0.25  # Increased tolerance for ZIP code areas to better cover Miami area
         
         # If ZIP code is provided, check direct match first
         if zip_code and zip_code in POPULATED_ZIP_CODES:
@@ -824,11 +824,15 @@ class PlacesAPIView(APIView):
 
     def post(self, request):
         start_time = time.time()
+        timing_logs = {}  # Track timing for different stages
 
         #set_cors_for_get('nurtr-places')
 
         #print('places request ', request.data)
         print('user is authenticated', request.data.get('is_authenticated', False))
+        
+        # Initialize timing tracking
+        timing_logs['request_parsing_start'] = time.time()
 
         # Check if user is authenticated
         is_authenticated = request.data.get('is_authenticated', False)
@@ -898,6 +902,9 @@ class PlacesAPIView(APIView):
             print(f"num types {len(types.keys())}")
 
         print(f"Params: {params}") # OK HERE
+        
+        timing_logs['request_parsing_end'] = time.time()
+        timing_logs['search_logic_start'] = time.time()
 
         # Check if we should use database-only search for popular category in populated areas
         use_database_only = False
@@ -917,6 +924,9 @@ class PlacesAPIView(APIView):
             queries = None
             api_results = asyncio.run(self.async_main(params, filters, min_price, max_price, queries, is_popular_category, skip_images=is_popular_category))
 
+        timing_logs['search_logic_end'] = time.time()
+        timing_logs['results_processing_start'] = time.time()
+        
         processed_results = [] # List to store final results (from DB or API)
 
         # Haversine function for distance calculation (moved outside the loop)
@@ -1128,12 +1138,34 @@ class PlacesAPIView(APIView):
         total_results = len(processed_results) # Use count from processed list
         paginated_results = processed_results # For now, returning all processed results
 
+        timing_logs['results_processing_end'] = time.time()
+        
+        # Calculate detailed timing metrics
         execution_time = round((time.time() - start_time) * 1000, 2)
+        request_parsing_time = round((timing_logs['request_parsing_end'] - timing_logs['request_parsing_start']) * 1000, 2)
+        search_time = round((timing_logs['search_logic_end'] - timing_logs['search_logic_start']) * 1000, 2)
+        processing_time = round((timing_logs['results_processing_end'] - timing_logs['results_processing_start']) * 1000, 2)
+        
+        # Log performance metrics
+        print(f"🚀 Performance Metrics:")
+        print(f"   📊 Total execution time: {execution_time}ms")
+        print(f"   🔍 Request parsing: {request_parsing_time}ms")
+        print(f"   🔎 Search logic: {search_time}ms")
+        print(f"   ⚡ Results processing: {processing_time}ms")
+        print(f"   📈 Results found: {total_results}")
+        print(f"   📍 Search method: {'Database-only' if use_database_only else 'API-hybrid'}")
+        
         return Response({
             "results": paginated_results, # Use the processed & paginated list
             "page": page,
             "total_results": total_results,
-            "execution_time_ms": execution_time
+            "execution_time_ms": execution_time,
+            "performance_breakdown": {
+                "request_parsing_ms": request_parsing_time,
+                "search_logic_ms": search_time,
+                "results_processing_ms": processing_time,
+                "search_method": "database_only" if use_database_only else "api_hybrid"
+            }
         }, status=HTTP_200_OK)
 
     def get_enhanced_kids_queries(self):
@@ -2097,6 +2129,10 @@ class PlacesAPIView(APIView):
         Returns:
             Response: A 429 response if the rate limit is exceeded, otherwise None.
         """
+        # Bypass rate limiting for batch operations
+        if hasattr(self, '_bypass_rate_limiting') and self._bypass_rate_limiting:
+            print("⚠️ Rate limiting bypassed for batch operation")
+            return None
         ip_address = self.get_client_ip(request)
 
         country_cache_key = f"ip_country_{ip_address}"
@@ -2196,6 +2232,7 @@ class BatchPopulatePlacesAPIView(APIView):
         print(f"🚀 REAL RUN MODE - Starting actual processing")
         print(f"⚠️ This will make {len(zip_codes) * queries_per_zip} API calls and cost money!")
         places_api = PlacesAPIView()
+        places_api._bypass_rate_limiting = True  # Flag to bypass rate limiting
         results = []
         stats = {
             'zip_codes_processed': 0,
